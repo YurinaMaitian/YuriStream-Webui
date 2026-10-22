@@ -3,13 +3,12 @@
     <header class="topbar">
       <span class="logo">YuriStream</span>
       <span class="topbar-right">
-        <el-tag effect="plain">监控 {{ status.monitoring }}</el-tag>
-        <el-tag type="danger" effect="dark">录制 {{ status.recording_count }}</el-tag>
+        <el-tag v-show="!isMobile" effect="plain">监控 {{ status.monitoring }}</el-tag>
+        <el-tag v-show="!isMobile" type="danger" effect="dark">录制 {{ status.recording_count }}</el-tag>
         <el-button size="small" @click="manageVisible = true">监控管理</el-button>
       </span>
     </header>
 
-    <!-- 左: 播放器 (占满列宽, 16:9; 宽屏模式同 B 站通栏布局) -->
     <div class="player-wrap">
       <div class="player-box">
         <div class="player-video">
@@ -22,16 +21,20 @@
         <div class="player-bar">
           <span class="pb-title">{{ liveUrl ? '实时转播中' : (playPath ? '回放' : '未在播放') }}</span>
           <span>
-            <el-button size="small" @click="wide = !wide">{{ wide ? '退出宽屏' : '宽屏' }}</el-button>
+            <el-button size="small" class="wide-btn" @click="wide = !wide">{{ wide ? '退出宽屏' : '宽屏' }}</el-button>
             <el-button size="small" text :disabled="!playPath && !liveUrl" @click="closePlayer">关闭</el-button>
           </span>
         </div>
       </div>
     </div>
 
-    <!-- 右列 -->
     <div class="right-col">
-      <el-card shadow="never" class="card rec-card">
+      <div class="m-tabs">
+        <span :class="{ on: mTab === 'rec' }" @click="mTab = 'rec'">正在录制</span>
+        <span :class="{ on: mTab === 'files' }" @click="mTab = 'files'">录像</span>
+      </div>
+
+      <el-card v-show="!isMobile || mTab === 'rec'" shadow="never" class="card rec-card">
         <template #header>正在录制</template>
         <div v-for="r in status.recording" :key="r.name" class="rec-item" @click="watchLive(r.name)">
           <div class="rec-info">
@@ -46,7 +49,7 @@
         <el-empty v-if="!status.recording?.length" description="暂无录制" :image-size="50" />
       </el-card>
 
-      <el-card shadow="never" class="card tree-card">
+      <el-card v-show="!isMobile || mTab === 'files'" shadow="never" class="card tree-card">
         <template #header>录像（{{ recordings.count }}）</template>
         <el-tree ref="treeRef" :data="treeData" node-key="key" :props="{ label: 'label' }"
                  @node-click="onNodeClick" @node-expand="d => expandedKeys.add(d.key)"
@@ -67,15 +70,15 @@
       </el-card>
     </div>
 
-    <el-dialog v-model="manageVisible" title="监控管理" width="560px" class="ma-dialog">
+    <el-dialog v-model="manageVisible" title="监控管理" :width="isMobile ? '94%' : '560px'" class="ma-dialog">
       <div class="row">
         <el-input v-model="newUrl" placeholder="粘贴直播间 URL，回车解析主播信息" clearable @keyup.enter="parseUrl" />
         <el-button :loading="parsing" @click="parseUrl">解析</el-button>
       </div>
-
       <div v-if="preview" class="preview">
         <el-tag size="small" effect="plain">{{ preview.platform }}</el-tag>
         <span class="pv-name">{{ preview.name }}</span>
+        <el-tag v-if="preview.title" size="small" type="info" effect="plain" class="pv-title">{{ preview.title }}</el-tag>
         <el-tag size="small" :type="preview.is_live ? 'danger' : 'info'">{{ preview.is_live ? '直播中' : '未在播' }}</el-tag>
         <span class="pv-gap"></span>
         <el-button type="primary" size="small" @click="startRecord">开始录制</el-button>
@@ -83,7 +86,6 @@
         <el-button size="small" @click="watchOnly">仅转播</el-button>
         <el-button size="small" text @click="preview = null">取消</el-button>
       </div>
-
       <div class="ma-sec">
         监控列表 <span>启用 {{ anchors.active.length }} · 停用 {{ anchors.paused.length }}</span>
       </div>
@@ -125,16 +127,32 @@ import { CaretRight, Download } from '@element-plus/icons-vue'
 const status = reactive({ monitoring: 0, recording_count: 0, recording: [] })
 const anchors = reactive({ active: [], paused: [] })
 const recordings = reactive({ count: 0, files: [] })
-const newUrl = ref(''), playPath = ref('')
-const liveUrl = ref(''), videoEl = ref(null), treeRef = ref(null)
-const parsing = ref(false), preview = ref(null), wide = ref(false)
+const newUrl = ref('')
+const playPath = ref('')
+const liveUrl = ref('')
 const liveName = ref('')
+const videoEl = ref(null)
+const treeRef = ref(null)
+const parsing = ref(false)
+const preview = ref(null)
+const wide = ref(false)
 const manageVisible = ref(false)
-const expandedKeys = new Set()   // 展开状态自管理, 刷新后恢复
-let hls = null, timer = null, lastRefresh = Date.now(), nowTs = ref(Date.now())
+const isMobile = ref(window.innerWidth <= 768)
+const mTab = ref('rec')
+const expandedKeys = new Set()
+let hls = null
+let timer = null
+let lastRefresh = Date.now()
+const nowTs = ref(Date.now())
 
-const API_BASE = location.port === '5173' ? 'http://127.0.0.1:8000' : ''
+// 仅本机开发(localhost:5173)直连 8000; 手机/生产走同源代理
+const API_BASE = (location.hostname === 'localhost' || location.hostname === '127.0.0.1') && location.port === '5173'
+  ? 'http://127.0.0.1:8000'
+  : ''
 
+const onResize = () => { isMobile.value = window.innerWidth <= 768 }
+
+// ---------- 录像树: 平台 → 主播 → 视频 ----------
 const treeData = computed(() => {
   const plats = new Map()
   for (const f of recordings.files) {
@@ -144,24 +162,44 @@ const treeData = computed(() => {
     if (!plats.has(plat)) plats.set(plat, new Map())
     const am = plats.get(plat)
     if (!am.has(anchor)) am.set(anchor, [])
-    am.get(anchor).push({ ...f, label: `${segs[segs.length - 1]} · ${fmtSize(f.size)}` })
+    am.get(anchor).push({ ...f, label: shortLabel(f.name, f.size), full: f.name })
   }
   return [...plats].map(([plat, am]) => ({
-    key: 'p:' + plat, label: `${plat}（${[...am.values()].flat().length}）`,
+    key: 'p:' + plat,
+    label: `${plat}（${[...am.values()].flat().length}）`,
     children: [...am].map(([anchor, files]) => ({
-      key: 'a:' + plat + '/' + anchor, label: `${anchor}（${files.length}）`,
-      children: files.map(f => ({ key: 'f:' + f.path, label: shortLabel(f.name, f.size), full: f.name, file: f })),
+      key: 'a:' + plat + '/' + anchor,
+      label: `${anchor}（${files.length}）`,
+      children: files.map(f => ({ key: 'f:' + f.path, label: f.label, full: f.full, file: f })),
     })),
   }))
 })
+
+function shortLabel(fname, size) {
+  const m = fname.match(/(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})/)
+  const t = m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}` : fname
+  return `${t} · ${fmtSize(size)}`
+}
 
 function onNodeClick(data) {
   if (data.file) play(data.file.path)
 }
 
+// ---------- 播放 ----------
+const playTitle = computed(() => {
+  if (liveUrl.value) return liveName.value || '直播'
+  if (playPath.value) return playPath.value.split(/[\\/]/).pop()
+  return ''
+})
+
+function prettyName(n) {
+  return (n || '').replace(/^序号\d+\s*/, '')
+}
+
 watch(playPath, p => {
   if (p && hls) { hls.destroy(); hls = null; liveUrl.value = '' }
 })
+
 watch(liveUrl, async url => {
   if (hls) { hls.destroy(); hls = null }
   if (!url) return
@@ -187,21 +225,12 @@ watch(liveUrl, async url => {
   }
 })
 
-const play = p => { playPath.value = p }
-function closePlayer() { playPath.value = ''; liveUrl.value = ''; liveName.value = '' }
+function play(p) { playPath.value = p }
 
-// 播放器左上角标题：直播显示主播(slug 还原空格)，回放显示文件名
-const playTitle = computed(() => {
-  if (liveUrl.value) return liveName.value || '直播'
-  if (playPath.value) return playPath.value.split(/[\\/]/).pop()
-  return ''
-})
-
-// 录像树显示名: 去掉与父节点重复的主播名前缀, 只留 月-日 时:分:秒 + 大小
-function shortLabel(fname, size) {
-  const m = fname.match(/(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})/)
-  const t = m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}` : fname
-  return `${t} · ${fmtSize(size)}`
+function closePlayer() {
+  playPath.value = ''
+  liveUrl.value = ''
+  liveName.value = ''
 }
 
 async function watchLive(name) {
@@ -213,20 +242,7 @@ async function watchLive(name) {
   liveName.value = '直播 · ' + prettyName(name)
 }
 
-// 仅转播不录制: 现场解析并打包, 不写监控列表
-async function watchOnly() {
-  const url = newUrl.value.trim()
-  if (!url) return
-  await addAnchor(url, preview.value?.name || '', true)   // 先入列表(停用态)留历史
-  preview.value = null; newUrl.value = ''
-  await rebroadcast(url)
-}
-
-// 录制线程内部名形如 "序号3 主播名", 展示时剥掉序号前缀
-function prettyName(n) {
-  return (n || '').replace(/^序号\d+\s*/, '')
-}
-
+// ---------- 监控管理 ----------
 function isRecording(u) {
   return !!u.name && status.recording?.some(r => r.name.split(' ').pop() === u.name)
 }
@@ -236,7 +252,8 @@ async function parseUrl() {
   parsing.value = true
   try {
     const res = await fetch('/api/parse', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: newUrl.value.trim() }),
     })
     const data = await res.json()
@@ -247,27 +264,41 @@ async function parseUrl() {
 
 async function addAnchor(url, name = '', paused = false) {
   const res = await fetch('/api/anchors', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url, name, paused }),
   })
   const data = await res.json()
   if (res.ok) { ElMessage.success(data.note || '已添加'); newUrl.value = ''; refresh() }
   else ElMessage.error(`失败：${data.error}`)
 }
-const confirmAdd = () => { addAnchor(newUrl.value.trim(), preview.value?.name || '', true); preview.value = null }
-const startRecord = () => { addAnchor(newUrl.value.trim(), preview.value?.name || '', false); preview.value = null }
-const enable = url => addAnchor(url)
-const disable = async url => {
-  await fetch(`/api/anchors?url=${encodeURIComponent(url)}`, { method: 'DELETE' }); refresh()
-}
-const removeAnchor = async url => {
-  await fetch(`/api/anchors?url=${encodeURIComponent(url)}&hard=true`, { method: 'DELETE' }); refresh()
+
+function confirmAdd() {
+  addAnchor(newUrl.value.trim(), preview.value?.name || '', true)
+  preview.value = null
 }
 
-// 对列表中任意主播发起转播: 后端判断开播状态, 未开播返回提示
+function startRecord() {
+  addAnchor(newUrl.value.trim(), preview.value?.name || '', false)
+  preview.value = null
+}
+
+const enable = url => addAnchor(url)
+
+async function disable(url) {
+  await fetch(`/api/anchors?url=${encodeURIComponent(url)}`, { method: 'DELETE' })
+  refresh()
+}
+
+async function removeAnchor(url) {
+  await fetch(`/api/anchors?url=${encodeURIComponent(url)}&hard=true`, { method: 'DELETE' })
+  refresh()
+}
+
 async function rebroadcast(url) {
   const res = await fetch('/api/live/watch', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url }),
   })
   const data = await res.json()
@@ -277,15 +308,26 @@ async function rebroadcast(url) {
   manageVisible.value = false
 }
 
+async function watchOnly() {
+  const url = newUrl.value.trim()
+  if (!url) return
+  await addAnchor(url, preview.value?.name || '', true)
+  preview.value = null
+  newUrl.value = ''
+  await rebroadcast(url)
+}
+
+// ---------- 数据轮询 ----------
 async function refresh() {
   const [s, a, r] = await Promise.all([
     fetch('/api/status').then(x => x.json()),
     fetch('/api/anchors').then(x => x.json()),
     fetch('/api/recordings').then(x => x.json()),
   ])
-  Object.assign(status, s); Object.assign(anchors, a); Object.assign(recordings, r)
+  Object.assign(status, s)
+  Object.assign(anchors, a)
+  Object.assign(recordings, r)
   lastRefresh = Date.now()
-  // 恢复树的展开状态（el-tree 在 data 替换后会丢, 需逐节点还原）
   const keep = new Set(expandedKeys)
   await nextTick()
   if (treeRef.value) {
@@ -300,16 +342,28 @@ function displayDur(r) {
   return r.duration_seconds + Math.floor((nowTs.value - lastRefresh) / 1000)
 }
 
-const fmtSize = n => n > 1 << 30 ? (n / (1 << 30)).toFixed(2) + ' GB'
-  : n > 1 << 20 ? (n / (1 << 20)).toFixed(1) + ' MB' : (n / 1024).toFixed(0) + ' KB'
-const fmtDuration = s =>
-  `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor(s / 60) % 60).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+function fmtSize(n) {
+  return n > 1 << 30 ? (n / (1 << 30)).toFixed(2) + ' GB'
+    : n > 1 << 20 ? (n / (1 << 20)).toFixed(1) + ' MB'
+    : (n / 1024).toFixed(0) + ' KB'
+}
+
+function fmtDuration(s) {
+  const pad = x => String(x).padStart(2, '0')
+  return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`
+}
 
 onMounted(() => {
   refresh()
   timer = setInterval(() => { nowTs.value = Date.now(); refresh() }, 5000)
+  window.addEventListener('resize', onResize)
 })
-onUnmounted(() => { clearInterval(timer); if (hls) hls.destroy() })
+
+onUnmounted(() => {
+  clearInterval(timer)
+  window.removeEventListener('resize', onResize)
+  if (hls) hls.destroy()
+})
 </script>
 
 <style>
@@ -321,7 +375,7 @@ body { background: #f4f5f7; margin: 0;
 </style>
 
 <style scoped>
-.page { display: grid; grid-template-columns: minmax(700px, 1fr) 360px; grid-template-rows: auto 1fr;
+.page { display: grid; grid-template-columns: minmax(700px, 1fr) 380px; grid-template-rows: auto 1fr;
   gap: 14px; height: 100vh; max-width: 1480px; margin: 0 auto; padding: 14px; box-sizing: border-box; }
 .topbar { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between;
   background: #fff; border: 1px solid #e8eaee; border-radius: 12px; padding: 8px 16px;
@@ -329,11 +383,10 @@ body { background: #f4f5f7; margin: 0;
 .logo { font-weight: 800; font-size: 16px; letter-spacing: .5px; color: #1f2329; }
 .topbar-right { display: flex; align-items: center; gap: 8px; }
 
-/* 播放器: 占满左列宽 */
 .player-wrap { min-height: 0; }
 .player-box { width: 100%; max-width: 1080px; background: #000; border-radius: 14px; overflow: hidden;
   box-shadow: 0 8px 28px rgba(20,20,50,.14); }
-/* 宽屏模式(B站"宽屏"): 播放器通栏, 右列移到下方并排 */
+.player-wrap.big .player-box { max-width: none; }
 .page.wide { grid-template-columns: 1fr; grid-template-rows: auto auto auto; height: auto; min-height: 100vh; }
 .page.wide .player-wrap { grid-column: 1 / -1; grid-row: 2; }
 .page.wide .player-box { max-width: none; }
@@ -373,10 +426,10 @@ body { background: #f4f5f7; margin: 0;
 .tree-ops { display: flex; align-items: center; gap: 6px; flex: none; }
 
 .row { display: flex; gap: 10px; }
-.ma-hint { font-size: 12px; color: #a8adb8; margin: 8px 2px 0; }
 .preview { display: flex; align-items: center; gap: 10px; margin-top: 12px; background: #f7f8fa;
-  border-radius: 8px; padding: 10px 12px; }
+  border-radius: 8px; padding: 10px 12px; flex-wrap: wrap; }
 .pv-name { font-weight: 600; color: #1f2329; }
+.pv-title { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pv-gap { flex: 1; }
 .ma-sec { font-size: 13px; font-weight: 600; color: #303133; margin: 18px 0 2px;
   display: flex; justify-content: space-between; align-items: baseline; }
@@ -391,4 +444,27 @@ body { background: #f4f5f7; margin: 0;
 .ma-url { font-size: 12px; color: #a8adb8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #dcdfe6; flex: none; }
 .dot.on { background: #f56c6c; box-shadow: 0 0 6px #f56c6c; }
+
+/* ---------- 移动端 (≤768px): 单列, 大触控目标, 页签切换 ---------- */
+.m-tabs { display: none; }
+@media (max-width: 768px) {
+  .page { display: flex; flex-direction: column; gap: 10px; height: 100dvh; padding: 10px; }
+  .topbar { flex: none; padding: 8px 12px; border-radius: 10px; }
+  .logo { font-size: 15px; }
+  .player-wrap { flex: none; }
+  .player-box { max-width: none; border-radius: 12px; }
+  .wide-btn { display: none; }
+  .player-bar { padding: 8px 10px; }
+  .right-col { flex: 1; min-height: 0; gap: 10px; }
+  .m-tabs { display: flex; gap: 10px; flex: none; }
+  .m-tabs span { flex: 1; text-align: center; padding: 11px 0; font-size: 14px; color: #606266;
+    background: #fff; border: 1px solid #e4e7ed; border-radius: 10px; }
+  .m-tabs span.on { color: #fff; background: var(--el-color-primary); border-color: var(--el-color-primary);
+    font-weight: 600; box-shadow: 0 2px 8px rgba(239,76,126,.3); }
+  .rec-card, .tree-card { flex: 1; min-height: 0; overflow: auto; }
+  .rec-item { padding: 14px 10px; }
+  .rec-name { max-width: none; font-size: 14px; }
+  .ma-item { padding: 12px 4px; flex-wrap: wrap; }
+  .el-tree-node__content { height: 40px; }
+}
 </style>
