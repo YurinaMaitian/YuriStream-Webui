@@ -54,7 +54,7 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="DouyinLiveRecorder API", version="0.5.4", lifespan=lifespan)
+app = FastAPI(title="DouyinLiveRecorder API", version="0.5.5", lifespan=lifespan)
 
 
 # ---------------- 边录边播（HLS） ----------------
@@ -344,7 +344,7 @@ def get_anchors():
     seen = set()
     cfg = Path(recorder.url_config_file)
     if cfg.exists():
-        for line in cfg.read_text(encoding="utf-8").splitlines():
+        for line in cfg.read_text(encoding="utf-8-sig").splitlines():
             lu = _line_url(line)
             if not lu:
                 continue
@@ -548,8 +548,8 @@ def _normalize_url(u: str) -> str:
 
 def _line_url(line: str) -> str:
     """从 URL_config.ini 的一行中提取 URL 段。
-    兼容形态: '#质量,url,主播: 名字' / 'url' / '#url' 等"""
-    l = line.lstrip("#").strip()
+    兼容形态: '#质量,url,主播: 名字' / 'url' / '#url' 等(含 BOM 头)"""
+    l = line.lstrip("#").strip().lstrip("\ufeff").strip()
     if not l:
         return ""
     parts = re.split("[,，]", l)
