@@ -285,14 +285,24 @@ function startRecord() {
 
 const enable = url => addAnchor(url)
 
+const opBusy = ref(false)
+
 async function disable(url) {
-  await fetch(`/api/anchors?url=${encodeURIComponent(url)}`, { method: 'DELETE' })
-  refresh()
+  if (opBusy.value) return
+  opBusy.value = true
+  try {
+    await fetch(`/api/anchors?url=${encodeURIComponent(url)}`, { method: 'DELETE' })
+    refresh()
+  } finally { opBusy.value = false }
 }
 
 async function removeAnchor(url) {
-  await fetch(`/api/anchors?url=${encodeURIComponent(url)}&hard=true`, { method: 'DELETE' })
-  refresh()
+  if (opBusy.value) return
+  opBusy.value = true
+  try {
+    await fetch(`/api/anchors?url=${encodeURIComponent(url)}&hard=true`, { method: 'DELETE' })
+    refresh()
+  } finally { opBusy.value = false }
 }
 
 async function rebroadcast(url) {

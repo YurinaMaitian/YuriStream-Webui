@@ -42,7 +42,7 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="DouyinLiveRecorder API", version="0.4.9", lifespan=lifespan)
+app = FastAPI(title="DouyinLiveRecorder API", version="0.5.2", lifespan=lifespan)
 
 
 # ---------------- 边录边播（HLS） ----------------
@@ -323,23 +323,31 @@ def _resolve_name_async(url: str, key: str) -> None:
 
 @app.get("/api/anchors")
 def get_anchors():
-    """主播列表：监控中 + 已注释（停用），附带主播名。
-    优先级: 配置行内的 "主播:" 后缀 > 录制线程回写 > 无名条目触发一次性后台解析回写"""
+    """主播列表: 直接以 URL_config.ini 文件为准(不再依赖主循环内存状态,
+    文件被修改后界面下一次轮询即反映, 无 3 秒延迟)。
+    附带: 无名条目触发一次性后台解析回写名字。"""
     names = getattr(recorder, "recording_names", {})
-    line_map = {}
+    active: list = []
+    paused: list = []
+    seen = set()
     cfg = Path(recorder.url_config_file)
     if cfg.exists():
         for line in cfg.read_text(encoding="utf-8").splitlines():
             lu = _line_url(line)
-            if lu:
-                line_map[_normalize_url(lu)] = line
+            if not lu:
+                continue
+            key = _normalize_url(lu)
+            if key in seen:
+                continue  # 历史重复行只显示一条
+            seen.add(key)
+            name = (
+                _extract_line_name(line)
+                or names.get(lu, "")
+                or _name_cache.get(key, "")
+            )
+            item = {"url": lu, "name": name}
+            (paused if line.lstrip().startswith("#") else active).append(item)
 
-    def name_of(url: str) -> str:
-        raw = line_map.get(_normalize_url(url), "")
-        return _extract_line_name(raw) or names.get(url, "")
-
-    active = [{"url": u, "name": name_of(u)} for u in recorder.running_list]
-    paused = [{"url": u, "name": name_of(u)} for u in recorder.url_comments]
     for item in active + paused:
         key = _normalize_url(item["url"])
         if not item["name"] and key not in _name_pending and key not in _name_resolved:
