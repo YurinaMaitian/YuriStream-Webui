@@ -15,6 +15,7 @@ Web API 层：把 main 模块的全局状态暴露为 REST 接口
 """
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -29,6 +30,17 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse, FileResponse
 
+# ---- .env 支持: 项目根目录的 .env 文件提供默认配置(注意: 不入库!) ----
+# 优先级: 已存在的环境变量 > .env 文件(setdefault 语义)
+_ENV_FILE = Path(__file__).resolve().parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip().strip("'").strip('"'))
+
+
 import main as recorder
 from src import spider as _spider, stream as _stream
 import asyncio  # 关键：import 不再启动录制（重构的成果）
@@ -42,7 +54,7 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="DouyinLiveRecorder API", version="0.5.2", lifespan=lifespan)
+app = FastAPI(title="DouyinLiveRecorder API", version="0.5.4", lifespan=lifespan)
 
 
 # ---------------- 边录边播（HLS） ----------------
@@ -845,4 +857,6 @@ def download(path: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(
+        app, host="127.0.0.1", port=int(os.environ.get("YS_PORT", "8000"))
+    )  # 服务器设 YS_PORT=8002
