@@ -3237,7 +3237,9 @@ def main() -> None:
                         start_str=start_with,
                     )
 
-            text_no_repeat_url = list(set(url_tuples_list))
+            text_no_repeat_url = list(
+                dict.fromkeys(url_tuples_list)
+            )  # 保序去重, 重启后序号不乱
 
             if len(text_no_repeat_url) > 0:
                 for url_tuple in text_no_repeat_url:

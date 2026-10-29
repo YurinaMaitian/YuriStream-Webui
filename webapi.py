@@ -42,7 +42,7 @@ if _ENV_FILE.exists():
 
 
 import main as recorder
-from src import spider as _spider, stream as _stream
+from src import spider as _spider, stream as _stream, analysis as _analysis
 import asyncio  # 关键：import 不再启动录制（重构的成果）
 
 
@@ -285,6 +285,7 @@ def get_status():
 
 _name_pending: set = set()  # 已排队解析的 url(规范化)
 _name_resolved: set = set()  # 已成功解析的 url
+_name_cache: dict = {}  # url(规范化) -> 主播名, 修复 /api/anchors 的 NameError
 _name_sem = threading.Semaphore(2)
 
 
@@ -325,7 +326,9 @@ def _resolve_name_async(url: str, key: str) -> None:
             try:
                 r = _resolve_port_info(url)
                 if r.get("ok"):
-                    _write_name_to_line(url, r["info"]["anchor_name"])
+                    _name = r["info"]["anchor_name"]
+                    _write_name_to_line(url, _name)
+                    _name_cache[key] = _name
                     _name_resolved.add(key)
             finally:
                 _name_pending.discard(key)
@@ -483,60 +486,6 @@ def _resolve_port_info(url: str) -> dict:
     if not info or not info.get("anchor_name"):
         return {"ok": False, "error": "未获取到主播信息（可能触发风控，稍后重试）"}
     return {"ok": True, "platform": platform, "info": info}
-
-    out_dir = LIVE_DIR / key
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for p in out_dir.glob("*"):
-        p.unlink()
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-user_agent",
-        (
-            "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 ("
-            "KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
-        ),
-        "-rw_timeout",
-        "15000000",
-        "-reconnect",
-        "1",
-        "-reconnect_streamed",
-        "1",
-        "-reconnect_at_eof",
-        "1",
-        "-reconnect_delay_max",
-        "60",
-        "-i",
-        stream_url,
-        "-c",
-        "copy",
-        "-f",
-        "hls",
-        "-hls_time",
-        "2",
-        "-hls_list_size",
-        "4",
-        "-hls_flags",
-        "delete_segments",
-        "-hls_segment_filename",
-        str(out_dir / "seg_%05d.ts"),
-        str(out_dir / "index.m3u8"),
-    ]
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    lf = open(
-        log_dir / f"live_{int(time.time() * 1000)}.log",
-        "w",
-        encoding="utf-8",
-        errors="ignore",
-    )
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
-    _watch_procs[key] = (proc, time.time())
-    return {
-        "ok": True,
-        "hls": f"/api/live/{key}/index.m3u8",
-        "name": info["anchor_name"],
-    }
 
 
 def _normalize_url(u: str) -> str:
@@ -757,6 +706,57 @@ def remove_anchor(url: str, hard: bool = False):
     return {"ok": True, "url": url, "hard_delete": hard}
 
 
+# ---------------- AI 内容分析（语音转写 + 大模型时间轴总结） ----------------
+
+
+class AnalysisIn(BaseModel):
+    path: str
+
+
+class AnalysisSaveIn(BaseModel):
+    path: str
+    segments: list = []
+    overall: str = ""
+
+
+@app.get("/api/analysis")
+def analysis_get(path: str):
+    """读取已缓存的内容总结（无则返回 analyzed=False）"""
+    target = _safe_resolve(path)
+    if target is None:
+        return JSONResponse({"error": "文件不存在"}, status_code=404)
+    result = _analysis.get_analysis(target)
+    if result is None:
+        return {"analyzed": False}
+    return {"analyzed": True, "result": result}
+
+
+@app.post("/api/analysis")
+def analysis_save(item: AnalysisSaveIn):
+    """保存总结段落（用户在弹窗里手改后的内容也走这里）"""
+    target = _safe_resolve(item.path)
+    if target is None:
+        return JSONResponse({"error": "文件不存在"}, status_code=404)
+    result = _analysis.save_analysis(target, item.segments, item.overall or None)
+    return {"ok": True, "result": result}
+
+
+@app.post("/api/analyze")
+def analyze_start(item: AnalysisIn):
+    """启动分析任务（音频/转写有缓存，重复触发只重跑 LLM 部分）"""
+    target = _safe_resolve(item.path)
+    if target is None:
+        return JSONResponse({"error": "文件不存在"}, status_code=404)
+    job = _analysis.start_analysis(target)
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/analyze/{job}")
+def analyze_status(job: str):
+    """任务进度轮询：{status, pct, msg, result?}"""
+    return _analysis.job_status(job)
+
+
 # ---------------- 在线播放与下载 ----------------
 
 
@@ -782,7 +782,8 @@ def _ensure_mp4(target: Path, transcode: bool) -> Path:
     if out.exists() and out.stat().st_mtime >= target.stat().st_mtime:
         return out
 
-    tmp = cache_dir / f"{key}.tmp.mp4"
+    # 临时文件故意不带 .mp4 后缀, 避免并发转换期间被 _cache_gc 的 glob("*.mp4") 统计或误删
+    tmp = cache_dir / f"{key}.tmp"
     cmd = ["ffmpeg", "-y", "-i", str(target)]
     if transcode:
         cmd += [
