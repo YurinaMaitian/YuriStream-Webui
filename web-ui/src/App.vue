@@ -205,7 +205,7 @@
         <el-button type="primary" :disabled="mergeList.length < 2" :loading="merging" @click="doMerge">{{ merging ? mergeJobText : '开始合并' }}</el-button>
       </template>
     </el-dialog>
-    <el-dialog v-model="analysisVisible" title="AI 内容总结" :width="isMobile ? '94%' : '580px'" top="5vh">
+    <el-dialog v-model="analysisVisible" title="AI 内容总结" :width="isMobile ? '94%' : '920px'" top="5vh" class="ana-dialog">
       <div class="ana-head">
         <span class="ana-path" :title="analysisPath">{{ nameOf(analysisPath) }}</span>
         <span class="pv-gap"></span>
@@ -215,6 +215,7 @@
         </template>
         <el-button v-if="!analyzing && analysisAnalyzed" size="small" type="primary" plain :icon="MagicStick" @click="regenAnalysis">重新生成</el-button>
         <el-button v-if="!analyzing && analysisAnalyzed" size="small" plain @click="startAnalysis('songs')">仅提取歌单</el-button>
+          <el-button v-if="!analyzing && analysisAnalyzed" size="small" type="primary" plain @click="copyIntro">复制投稿简介</el-button>
         <template v-if="!analyzing && !analysisAnalyzed">
           <el-button size="small" type="primary" :icon="MagicStick" @click="startAnalysis('full')">开始生成</el-button>
           <el-button size="small" plain @click="startAnalysis('songs')">仅提取歌单</el-button>
@@ -278,6 +279,12 @@
           <el-button @click="analysisVisible = false">关闭</el-button>
           <el-button type="primary" :disabled="!analysisDirty" :loading="analysisSaving" @click="saveAnalysisEdits">保存修改</el-button>
         </span>
+      </template>
+    </el-dialog>
+    <el-dialog v-model="introVisible" title="投稿简介（剪贴板受限，请手动复制）" :width="isMobile ? '94%' : '560px'">
+      <el-input type="textarea" :rows="16" :model-value="introText" readonly class="ana-plain" />
+      <template #footer>
+        <el-button type="primary" @click="introVisible = false">关闭</el-button>
       </template>
     </el-dialog>
   </div>
@@ -886,6 +893,22 @@ async function playSeg(seg) {
   if (playPath.value !== analysisPath.value) play(analysisPath.value)
   await nextTick()
   if (videoEl.value) videoEl.value.currentTime = parseTs(seg.startText) + 0.3
+}
+
+// ---------- 投稿简介导出 (B站转载格式, 复制即用) ----------
+const introVisible = ref(false)
+const introText = ref('')
+async function copyIntro() {
+  const res = await fetch(`/api/bili/intro?path=${encodeURIComponent(analysisPath.value)}`)
+  const data = await res.json()
+  if (!res.ok) { ElMessage.error(`生成失败：${data.error}`); return }
+  introText.value = `${data.title}\n\n${data.desc}`
+  try {
+    await navigator.clipboard.writeText(introText.value)
+    ElMessage.success('投稿简介已复制到剪贴板')
+  } catch {
+    introVisible.value = true  // 剪贴板受限时弹窗手动复制
+  }
 }
 
 // ---------- 数据轮询 ----------

@@ -15,6 +15,7 @@ Web API 层：把 main 模块的全局状态暴露为 REST 接口
 """
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -48,6 +49,7 @@ if _ENV_FILE.exists():
 import main as recorder
 from src import spider as _spider, stream as _stream, analysis as _analysis
 import asyncio  # 关键：import 不再启动录制（重构的成果）
+import bili_intro as _bili_intro  # 投稿简介生成 (项目根目录)
 
 
 @asynccontextmanager
@@ -762,6 +764,58 @@ def analyze_start(item: AnalysisIn):
 def analyze_status(job: str):
     """任务进度轮询：{status, pct, msg, result?}"""
     return _analysis.job_status(job)
+
+
+# ---------------- B站投稿简介导出 (full / songs 两种分析模式通用) ----------------
+# meta.json(录制侧落盘)缺失时, bili_intro 自动回退: 目录名推断主播 +
+# config/uploader_profiles.json 里该主播的 room_url/home_url, 旧录像同样可用。
+
+
+@app.get("/api/bili/intro")
+def bili_intro_endpoint(path: str):
+    """生成 B站投稿 payload(标题/简介/标签)。无总结结果时返回 400 提示先提取。"""
+    target = _safe_resolve(path)
+    if target is None:
+        return JSONResponse({"error": "文件不存在"}, status_code=404)
+    result = _analysis.get_analysis(target)
+    if not result:
+        return JSONResponse(
+            {"error": "尚无分析结果，请先点「视频总结」或「仅提取歌单」"},
+            status_code=400,
+        )
+    meta: dict = {}
+    for _cand in (
+        Path(str(target) + ".meta.json"),
+        target.with_name(target.name + ".meta.json"),
+    ):
+        if _cand.exists():
+            try:
+                meta = json.loads(_cand.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            break
+    return _bili_intro.build_upload_payload(meta, result, str(target))
+
+
+@app.get("/api/bili/resolve_room")
+def bili_resolve_room(url: str):
+    """把抖音用户主页解析成稳定直播间地址(复用项目自带转化链 spider.get_unique_id,
+    主播未开播也能拿到; 离线时打开仅显示未开播页)。"""
+    u = url.strip()
+    if "douyin.com/user/" in u:
+        try:
+            unique_id = asyncio.run(_spider.get_unique_id(u))
+            if unique_id:
+                return {
+                    "ok": True,
+                    "room_url": f"https://live.douyin.com/{unique_id}",
+                    "note": "该地址长期稳定，未开播也能打开；可直接填进 uploader_profiles.json",
+                }
+        except Exception as e:
+            return JSONResponse({"error": f"解析失败: {e}"}, status_code=400)
+    return JSONResponse(
+        {"error": "暂只支持抖音用户主页（douyin.com/user/...）"}, status_code=400
+    )
 
 
 # ---------------- 在线播放与下载 ----------------
