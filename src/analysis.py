@@ -1294,6 +1294,234 @@ def _apply_recog_alias(merged: list) -> list:
     return merged
 
 
+def _patches_path(video: Path) -> Path:
+    return CACHE_DIR / f"{_cache_key(video)}.patches.json"
+
+
+def _load_patches(video: Path) -> list:
+    try:
+        p = _patches_path(video)
+        if p.exists():
+            return list(json.loads(p.read_text(encoding="utf-8")).get("patches") or [])
+    except Exception:
+        pass
+    return []
+
+
+def _learn_patches_from_edits(old: dict, new_segs: list, video: Path) -> None:
+    """人工补丁层(逐视频, v8): 审核保存时把改名/挪起点/删行/补行全部记成补丁,
+    重新生成后按位置自动重放——人工结论永不丢失, 审核一次终身有效。
+    与别名表互补: 别名管"识别引擎的稳定误配"(可跨场复用, 但要求src=reco且旧名非未知),
+    补丁管"这一场这个位置就该是这首歌"——未知→命名、src=llm 的改名都能记。
+    合并行的处理: 被并入新行的旧段记为"改名成新行歌名", 重放时碎片改同名后
+    由 merge 并回一行, 效果等同用户的合并操作, 不会把歌吞掉"""
+    try:
+        old_songs = [s for s in (old.get("segments") or []) if s.get("type") == "song"]
+        if not old_songs:
+            return
+        new_songs = [s for s in new_segs if s.get("type") == "song"]
+        patches = _load_patches(video)
+        changed = False
+
+        def upsert(patch: dict) -> None:
+            nonlocal changed
+            for i, q in enumerate(patches):
+                if abs(int(q.get("start", -(10**9))) - int(patch["start"])) > 10:
+                    continue
+                if "ensure" in patch:
+                    same = "ensure" in q
+                else:
+                    # 改名/删除补丁按 (起点±10s, from标题) 双键去重:
+                    # 同起点的双行(已知+未知)各自产补丁, 只按起点会互相顶掉
+                    # (删绝对占有和删未知同起点, 后者顶掉前者 → 重复簇复活)
+                    same = "from" in q and (q.get("from") or "") == (
+                        patch.get("from") or ""
+                    )
+                if same:
+                    if q != patch:
+                        patches[i] = patch
+                        changed = True
+                    return
+            patches.append(patch)
+            changed = True
+
+        matched_new: set = set()
+        for o in old_songs:
+            o_start = int(o["start"])
+            o_title = (o.get("title") or "").strip() or "未知曲目"
+            # ①起点基本没变(±6s) → 同行编辑。
+            #   新行必须"未占用"(一行新数据不能同时是多行旧数据的编辑结果,
+            #   否则同起点双行会被双双匹配到同一行, 脑补出从未发生的改名),
+            #   且多候选时同名优先(同起点的 已知+未知 双行各归各)
+            pool = [
+                n
+                for n in new_songs
+                if id(n) not in matched_new and abs(int(n["start"]) - o_start) <= 6
+            ]
+            cand = None
+            if pool:
+                same = [
+                    n
+                    for n in pool
+                    if ((n.get("title") or "").strip() or "未知曲目") == o_title
+                ]
+                cand = same[0] if same else pool[0]
+            merged_into = False
+            if cand is None:
+                # ②旧段起点落在某新行区间内部 → 被合并吸收: 记为改名(+挪起点),
+                #   重放时碎片改同名后由 merge 并回, 不会吞歌。
+                #   必须用 < end-10 留余量: 相邻行的 end 常等于本行 start
+                #   (resolve_overlaps 切的边界), 裸 <= 会把"挪起点"误判成合并,
+                #   学出《我们的爱》→《带我走》这种毒补丁
+                for n in new_songs:
+                    if id(n) in matched_new:
+                        continue
+                    if int(n["start"]) - 8 <= o_start < int(n["end"]) - 10:
+                        cand, merged_into = n, True
+                        break
+            if cand is None:
+                # ③整行删除: 重放时仅当跑出完全相同的旧标题才删(防误伤新结果)
+                upsert({"start": o_start, "from": o_title, "to": None})
+                _log(f"人工补丁学习: 删除 {fmt_ts(o_start)} 《{o_title}》")
+                continue
+            matched_new.add(id(cand))
+            n_title = (cand.get("title") or "").strip() or "未知曲目"
+            n_start = int(cand["start"])
+            patch = {"start": o_start, "from": o_title, "to": n_title}
+            if abs(n_start - o_start) > 3:
+                patch["new_start"] = n_start
+            if n_title != o_title or "new_start" in patch:
+                upsert(patch)
+                what = (
+                    f"《{o_title}》→《{n_title}》" if n_title != o_title else "挪起点"
+                )
+                if merged_into:
+                    what = f"合并入行({what})"
+                _log(f"人工补丁学习: {fmt_ts(o_start)} {what}")
+        # 用户手动新增的行(旧结果无对应) → 补录补丁, 重放时若无歌覆盖该区间则插入
+        for n in new_songs:
+            if id(n) in matched_new:
+                continue
+            upsert(
+                {
+                    "start": int(n["start"]),
+                    "end": int(n["end"]),
+                    "ensure": (n.get("title") or "").strip() or "未知曲目",
+                }
+            )
+            _log(
+                f"人工补丁学习: 补录 {fmt_ts(int(n['start']))}"
+                f" 《{(n.get('title') or '').strip()}》"
+            )
+        if changed:
+            p = _patches_path(video)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                json.dumps(
+                    {
+                        "video": video.name,
+                        "updated": datetime.now().isoformat(timespec="seconds"),
+                        "patches": sorted(
+                            patches, key=lambda x: int(x.get("start", 0))
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+    except Exception as e:
+        _log(f"人工补丁学习失败({e}), 忽略")
+
+
+def _apply_manual_patches(merged: list, video: Path) -> list:
+    """重放人工补丁(见 _learn_patches_from_edits)。在仲裁/清洗/对齐之后、
+    最终置信分层之前执行: 人工结论是最高优先级证据, 命中的行直接置 high。
+    顺序: 改名/挪起点 → 删除 → 补录, 调用方随后再 merge+整形一次"""
+    patches = _load_patches(video)
+    if not patches:
+        return merged
+    songs = [sg for sg in merged if sg.get("type") == "song"]
+    drop: set = set()
+    for p in patches:
+        p_start = int(p.get("start", 0))
+        if "ensure" in p:
+            title = (p.get("ensure") or "").strip()
+            # 补录未知曲目没有意义(用户加行一定会命名, 未知补录只会污染复制粘贴的歌单)
+            if not title or title == "未知曲目":
+                continue
+            e_start, e_end = p_start, int(p.get("end") or p_start + 60)
+            covered = any(
+                id(sg) not in drop
+                and min(sg["end"], e_end) - max(sg["start"], e_start) > 10
+                for sg in songs
+            )
+            if not covered:
+                _log(f"人工补丁补录: {fmt_ts(e_start)} 《{title}》")
+                # summary 留空: 用户会直接复制粘贴歌单, 任何标注文字都是污染
+                merged.append(
+                    {
+                        "start": e_start,
+                        "end": e_end,
+                        "type": "song",
+                        "title": title,
+                        "summary": "",
+                        "src": "manual",
+                        "patched": True,
+                        "conf": "high",
+                    }
+                )
+                songs.append(merged[-1])
+            continue
+        # 同起点可能存在多行(已知+未知双碎片): 优先命中标题与补丁 from 一致的那行
+        pool = [
+            sg
+            for sg in songs
+            if id(sg) not in drop and abs(int(sg["start"]) - p_start) <= 12
+        ]
+        target = None
+        if pool:
+            frm = (p.get("from") or "").strip()
+            same = [
+                sg
+                for sg in pool
+                if ((sg.get("title") or "").strip() or "未知曲目") == frm
+            ]
+            target = same[0] if same else pool[0]
+        if target is None:
+            continue
+        if p.get("to") is None:
+            # 删除补丁: 仅当重跑出完全相同的旧标题才生效
+            if ((target.get("title") or "").strip() or "未知曲目") == (
+                p.get("from") or ""
+            ):
+                _log(
+                    f"人工补丁删除: {fmt_ts(target['start'])} 《{target.get('title')}》"
+                )
+                drop.add(id(target))
+            continue
+        to = (p.get("to") or "").strip()
+        cur = (target.get("title") or "").strip()
+        if to and cur != to:
+            _log(
+                f"人工补丁改名: {fmt_ts(target['start'])} 《{cur or '未知曲目'}》→《{to}》"
+            )
+            target["title"] = to
+        target["patched"] = True
+        target["conf"] = "high"
+        ns = p.get("new_start")
+        if ns is not None and abs(int(ns) - int(target["start"])) > 3:
+            _log(
+                f"人工补丁起点: {fmt_ts(target['start'])}→{fmt_ts(int(ns))}"
+                f" 《{target['title']}》"
+            )
+            target["start"] = max(0, int(ns))
+    if drop:
+        merged = [sg for sg in merged if id(sg) not in drop]
+    merged.sort(key=lambda x: (x["start"], x["end"]))
+    return merged
+
+
 def _song_hint_text(hits: list, cs: float, ce: float) -> str:
     """把与当前 LLM 窗口重叠的权威歌单注入提示"""
     lines = [
@@ -1995,14 +2223,18 @@ def _split_giant_song_segments(merged: list, music_segs: list, hits: list) -> li
 
 
 def _align_song_starts_to_music(merged: list, music_segs: list) -> list:
-    """唱歌段开始时间戳对齐音频级音乐段起点(只提前, 绝不推后):
-    命中窗口中点切出的边界常偏进歌里几十秒(关键词标9:56, 实际9:19开唱),
-    而 inaSpeechSegmenter 的音乐起点与真实开唱只差秒级——以它为准。
-    只提前不推后: 提前=多留点前奏口播, 观众点时间戳不会错过开头;
-    推后有切掉开唱的风险(无情画5:33这种用户认可的略早起点不能动)。"""
+    """唱歌段开始时间戳对齐音频级音乐段起点, 两个方向:
+    ①提前对齐: 命中窗口中点切出的边界常偏进歌里几十秒(关键词标9:56, 实际9:19开唱),
+      而 inaSpeechSegmenter 的音乐起点与真实开唱只差秒级——以它为准;
+    ②推后对齐(ALIGN_LATER_MAX, 默认120s, 0=关闭): 段起点落在纯口播区
+      (不在任何音乐段内)且开唱在阈值内时, 起点推到音乐起点——主播先报歌名、
+      回几句弹幕才开唱的场景, 章节不该从聊天开始(v8 实测: 用户手动后挪了
+      7 个起点, 幅度 22~107s, 全部符合这个模式)。推后只推到音乐段起点,
+      绝不推进歌里; 微调(<6s)不动, 避免时间戳抖动"""
     if not music_segs:
         return merged
     starts = sorted(float(m["start"]) for m in music_segs)
+    later_max = _env_int("ALIGN_LATER_MAX", 120)
     for sg in merged:
         if sg["type"] != "song" or not (sg.get("title") or "").strip():
             continue
@@ -2014,6 +2246,57 @@ def _align_song_starts_to_music(merged: list, music_segs: list) -> list:
                 f" 《{sg['title']}》"
             )
             sg["start"] = new_start
+            continue
+        if later_max <= 0:
+            continue
+        # 段起点本身已在音乐段里(歌正唱着) → 不动, 推后会切开唱
+        if any(
+            float(m["start"]) - 2 <= sg["start"] <= float(m["end"]) + 2
+            for m in music_segs
+        ):
+            continue
+        nxt = [
+            s for s in starts if 6 < s - sg["start"] <= later_max and s < sg["end"] - 10
+        ]
+        if nxt:
+            new_start = int(min(nxt))  # 段起点之后第一个音乐起点
+            _log(
+                f"起点对齐音乐段(推后{new_start - sg['start']}s): "
+                f"{fmt_ts(sg['start'])}→{fmt_ts(new_start)} 《{sg['title']}》"
+            )
+            sg["start"] = new_start
+    return merged
+
+
+def _absorb_shadowed_unknowns(merged: list) -> list:
+    """吸收同起点的双检测未知行: 切片碎片与幽灵命中经音乐段对齐后常撞在
+    同一起点(1:18:53《绝对占有相对自由》+《未知曲目》双行案例: 碎片被对齐
+    推后11s、幽灵行被对齐提前27s, 正好撞车), 同一起点(±15s)的一行有名、
+    一行未知 = 同一场表演被检测了两次——歌已被有名行展示, 删除未知行并把
+    它的跨度并进有名行(否则重叠整形会把先到的有名行裁成1s, 歌体时长全丢)。
+    必须在对齐之后、resolve_overlaps 之前执行。
+    安全性: 两首不同的歌真实起点不可能相差≤15s, 正经未知行不会被误吸"""
+    songs = [sg for sg in merged if sg.get("type") == "song"]
+    titled = [
+        sg for sg in songs if (sg.get("title") or "").strip() not in ("", "未知曲目")
+    ]
+    drop: set = set()
+    for u in songs:
+        if (u.get("title") or "").strip() != "未知曲目" or id(u) in drop:
+            continue
+        for t in titled:
+            if t is u or id(t) in drop:
+                continue
+            if abs(int(u["start"]) - int(t["start"])) <= 15:
+                _log(
+                    f"吸收同起点双检测未知行: {fmt_ts(u['start'])} 并入"
+                    f"《{t['title']}》(跨度延伸至{fmt_ts(max(int(t['end']), int(u['end'])))})"
+                )
+                t["end"] = max(int(t["end"]), int(u["end"]))
+                drop.add(id(u))
+                break
+    if drop:
+        merged = [sg for sg in merged if id(sg) not in drop]
     return merged
 
 
@@ -2066,16 +2349,62 @@ def _arbitrate_titles(merged: list, lyric_ids: dict, cands_map: dict) -> list:
             or sg["title"] in ("", "未知曲目")
             or (sg.get("src") == "reco" and int(sg.get("rec_times") or 0) < 50)
         )
+        # 段名截断: 现有标题是LLM判定结果的子串(如《相对自由》⊂《绝对占有相对自由》),
+        # 说明切片/来源只记住了半截歌名, LLM high 时直接补全。
+        # 该路径不受 weak_current 限制(src=llm 的段没有rec可判weak), 但仍受邻居护栏约束
+        cur_title = (sg["title"] or "").strip()
+        truncated_title = (
+            len(cur_title) >= 3 and bool(lt) and cur_title != lt and cur_title in lt
+        )
+        # 同名护栏(主播惯例: 一场不重复唱同一首): 翻案目标若在别行已被强证据
+        # 占据(rec>=50或人工补丁确认), 本行的翻案必是窗口外溢/误配幻影——
+        # 1:25:02碎片被误判《一样的月光》high, 翻案后与1:28:21真身同名,
+        # 后续merge把真身吞掉(漏歌); v7的30:14→《虚拟》(42:45有rec=92438真身)同理
+        dup_claimed = bool(lt) and any(
+            t2 is not sg
+            and (t2.get("title") or "").strip() == lt
+            and (
+                int(t2.get("rec_times") or 0) >= 50
+                or t2.get("patched")
+                or t2.get("aliased")
+            )
+            for t2 in targets
+        )
+        if (
+            lt
+            and lt not in ("", "未知曲目")
+            and lt != cur_title
+            and lid.get("confidence") == "high"
+            and dup_claimed
+        ):
+            _log(
+                f"歌词仲裁: {pos} 《{cur_title or '未知曲目'}》翻案目标《{lt}》"
+                f"与他行强证据同名, 阻断(一场不重唱)"
+            )
+        # 别名修正过的标题是人工级证据(位置锁定的历史纠错结论),
+        # 不允许被当次歌词投票推翻——骰子 variance 不能翻盘已确证的知识
+        # (1:03:54《带我走》被歌词骰子翻成《绝对占有相对自由》的实测惨案)
+        if (
+            sg.get("aliased")
+            and lt
+            and lt not in ("", "未知曲目")
+            and lt != cur_title
+            and lid.get("confidence") == "high"
+        ):
+            _log(f"歌词仲裁: {pos} 《{cur_title}》别名已确证, 阻断翻案→《{lt}》")
         if (
             lt
             and lt != "未知曲目"
             and lid.get("confidence") == "high"
             and lid.get("chars", 0) >= 25
-            and (retrieval_support or weak_current)
+            and (retrieval_support or weak_current or truncated_title)
             and lt not in neighbor_titles
+            and not dup_claimed
+            and not sg.get("aliased")
             and (
                 sg["end"] - sg["start"] >= 60
                 or retrieval_support
+                or truncated_title
                 # 短段是"未知"时没什么可失去的: 文本量足够(>=100字)就信LLM,
                 # 否则 v5 的短段护栏会把 1:18:39→绝对占有相对自由 这类正确翻案也拦掉
                 or (sg["title"] in ("", "未知曲目") and lid.get("chars", 0) >= 100)
@@ -2092,12 +2421,11 @@ def _arbitrate_titles(merged: list, lyric_ids: dict, cands_map: dict) -> list:
         rt = int(sg.get("rec_times") or 0)
         claimed = (sg["title"] or "").strip()
         llm_confirms = bool(lt) and lt == claimed and lid.get("confidence") == "high"
-        if (
-            sg.get("src") == "reco"
-            and sg.get("engine") in ("hum", "legacy")
-            and 0 < rt < 50
-        ):
-            # 冷门匹配: 全球仅被识别过几十次的歌, 对热门翻唱场基本是错配
+        if sg.get("src") == "reco" and sg.get("engine") == "legacy" and 0 < rt < 50:
+            # 来源不明的旧缓存冷门命中, 对热门翻唱场基本是错配。
+            # v8 起 hum 不再适用本规则: hum 冷门命中常是真冷门歌
+            # (《我们的爱》全球仅识别1次但确实是它, 被误杀过),
+            # hum 的稳定性误配由别名表负责, 标题保留进待审比抹成未知更有用
             _log(f"冷门匹配降级为未知(全球仅识别{rt}次): 《{sg['title']}》")
             sg["title"] = "未知曲目"
             continue
@@ -2146,6 +2474,43 @@ def _arbitrate_titles(merged: list, lyric_ids: dict, cands_map: dict) -> list:
                 f"(检索top1《{cands[0]['title']}》{cands[0]['score']}, LLM:{lt or '无'})"
             )
             sg["conf"] = "mid"
+    return merged
+
+
+def _dedup_same_title_weak(merged: list) -> list:
+    """同名去重(主播惯例: 一场不重复唱同一首), 必须在合并链之后调用:
+    同一首歌被切成的相邻碎片由 merge 先并回一行(25:15+27:44 牵丝戏碎片对,
+    一强一弱, 若在合并前跑本规则会把弱的降成未知、永远无法并回——实测误伤)。
+    合并后仍跨大时段重名的才是真嫌疑: 恰有唯一强证据行(rec>=50/人工补丁)时,
+    其余弱证据同名行必是幻影(误配/外溢翻案残留), 降级为未知并保留原名进候选
+    (前端可一键恢复)。强强/弱弱同名不动: 强强交人工, 弱弱本来就该一起留着审"""
+    songs = [sg for sg in merged if sg.get("type") == "song"]
+    dup_groups: dict = {}
+    for sg in songs:
+        t = (sg.get("title") or "").strip()
+        if t and t != "未知曲目":
+            dup_groups.setdefault(t, []).append(sg)
+    for t, rows in dup_groups.items():
+        if len(rows) < 2:
+            continue
+        strong_rows = [
+            r
+            for r in rows
+            if r.get("patched")
+            or r.get("aliased")
+            or int(r.get("rec_times") or 0) >= 50
+        ]
+        if len(strong_rows) != 1:
+            continue
+        for r in rows:
+            if any(r is sr for sr in strong_rows):
+                continue
+            _log(
+                f"同名弱证据降级: {fmt_ts(r['start'])} 《{t}》→未知曲目"
+                f"(强证据同名在{fmt_ts(strong_rows[0]['start'])})"
+            )
+            r["cands"] = [{"title": t, "score": 0}] + (r.get("cands") or [])
+            r["title"] = "未知曲目"
     return merged
 
 
@@ -2577,11 +2942,19 @@ def _run_analysis(job_id: str, video: Path, mode: str = "full") -> None:
         # 例如补漏命中的两个《晴》夹着一个10s闲聊——早期那次桥接管不到晚到的段
         merged = _bridge_split_songs(_drop_short_songs(_merge_adjacent_songs(merged)))
         merged = _drop_short_songs(_merge_adjacent_songs(merged))
-        # 开始时间戳对齐音频级音乐段(只提前), 再整形重叠边界
+        # 开始时间戳对齐音频级音乐段(提前+口播区推后), 先吸收对齐撞车的
+        # 双检测未知行, 再整形重叠边界
         merged = _align_song_starts_to_music(merged, _music_segs)
+        merged = _absorb_shadowed_unknowns(merged)
         merged = _resolve_overlaps(merged)
+        # 人工补丁重放(最高优先级证据), 补丁改同名后可能有新可合并碎片, 再收尾一次
+        merged = _apply_manual_patches(merged, video)
+        merged = _resolve_overlaps(_merge_adjacent_songs(merged))
+        # 同名去重放在合并之后: 同歌碎片先并回, 剩下的跨时段重名才按幻影降级
+        merged = _dedup_same_title_weak(merged)
         for _sg in merged:
-            _sg["conf"] = _conf_tier(_sg)
+            if not _sg.get("patched"):
+                _sg["conf"] = _conf_tier(_sg)
             if _sg["type"] == "song":
                 _log(
                     f"conf={_sg['conf'] or '-'} [{fmt_ts(_sg['start'])}] 《{_sg['title']}》"
@@ -2661,6 +3034,7 @@ def save_analysis(video: Path, segments: list, overall: str | None = None) -> di
             segs.append(norm)
     segs.sort(key=lambda x: (x["start"], x["end"]))
     _learn_alias_from_edits(old, segs)  # 人工纠正识别错名 → 自动学进别名表
+    _learn_patches_from_edits(old, segs, video)  # 人工修正补丁层: 重跑自动重放
     result = {
         "version": 1,
         "video": old.get("video", video.name),
