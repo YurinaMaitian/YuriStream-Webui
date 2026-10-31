@@ -214,7 +214,11 @@
           <el-button size="small" :type="analysisView === 'text' ? 'primary' : 'default'" @click="analysisView = 'text'">纯文本</el-button>
         </template>
         <el-button v-if="!analyzing && analysisAnalyzed" size="small" type="primary" plain :icon="MagicStick" @click="regenAnalysis">重新生成</el-button>
-        <el-button v-if="!analyzing && !analysisAnalyzed" size="small" type="primary" :icon="MagicStick" @click="startAnalysis">开始生成</el-button>
+        <el-button v-if="!analyzing && analysisAnalyzed" size="small" plain @click="startAnalysis('songs')">仅提取歌单</el-button>
+        <template v-if="!analyzing && !analysisAnalyzed">
+          <el-button size="small" type="primary" :icon="MagicStick" @click="startAnalysis('full')">开始生成</el-button>
+          <el-button size="small" plain @click="startAnalysis('songs')">仅提取歌单</el-button>
+        </template>
       </div>
       <div v-if="analyzing" class="ana-progress">
         <el-progress :percentage="analysisPct" :stroke-width="8" />
@@ -224,11 +228,13 @@
         <template v-if="analysisView === 'edit'">
         <div class="ana-ov-row">
           <span class="ana-ov-label">整体总结</span>
-          <el-input v-model="analysisOverall" type="textarea" :rows="2" size="small" placeholder="2-3 句话概括整场直播（纯文本导出的开头）" @input="markDirty" />
+          <el-input v-model="analysisOverall" type="textarea" :rows="2" size="small" placeholder="2-3 句话概括整场直播" @input="markDirty" />
         </div>
-        <div class="ana-sec-title">🎵 内容时间轴（可直接编辑，▶ 跳转播放该段）</div>
+        <div class="ana-sec-title">🎵 内容时间轴</div>
         <div class="ana-list">
-          <div v-for="(seg, i) in analysisSegments" :key="i" class="ana-seg">
+          <div v-for="(seg, i) in analysisSegments" :key="i"
+             v-show="(!songOnly || seg.type === 'song') && (!reviewOnly || seg.conf !== 'high')"
+             class="ana-seg" :class="{ 'ana-seg-warn': seg.conf && seg.conf !== 'high' }">
             <el-button :icon="CaretRight" circle size="small" title="从此处播放" @click="playSeg(seg)" />
             <el-input v-model="seg.startText" size="small" class="ana-time" placeholder="00:00" @change="markDirty" />
             <el-button link size="small" class="ana-nudge" title="开始 -10 秒" @click="nudgeSeg(seg, 'startText', -10)">‹</el-button>
@@ -243,21 +249,28 @@
               <el-option label="📌 其他" value="other" />
             </el-select>
             <el-input v-if="seg.type === 'song'" v-model="seg.title" size="small" class="ana-title" placeholder="歌曲名（识别不出填 未知曲目）" @change="markDirty" />
+            <el-tag v-if="seg.type === 'song'" size="small" effect="plain" class="ana-src-tag"
+                    :type="seg.conf === 'high' ? 'success' : seg.conf === 'low' ? 'danger' : 'warning'">
+              {{ seg.src === 'reco' ? '识别' : '猜测' }}{{ seg.conf === 'low' ? '·存疑' : seg.conf === 'mid' ? '·待审' : '' }}
+            </el-tag>
             <el-input v-model="seg.summary" size="small" class="ana-summary" placeholder="一句话总结（可选）" @change="markDirty" />
             <el-button :icon="Delete" circle size="small" text type="danger" title="删除该段" @click="delSeg(i)" />
           </div>
         </div>
         <el-button size="small" text type="primary" @click="addSeg">+ 添加段落</el-button>
+        <el-checkbox v-model="songOnly" size="small" class="ana-song-only">只看唱歌</el-checkbox>
+        <el-checkbox v-model="reviewOnly" size="small">只看待审</el-checkbox>
         </template>
         <template v-else>
-          <div class="ana-sec-title">📋 纯文本（可直接全选复制，用于 B站简介/评论区）</div>
           <el-input type="textarea" :rows="14" :model-value="plainText" readonly class="ana-plain" />
           <div class="ana-copy-row">
+            <el-checkbox v-model="textSongsOnly" size="small">仅歌单</el-checkbox>
+            <span class="pv-gap"></span>
             <el-button size="small" type="primary" plain @click="copyAnalysisText">复制全部</el-button>
           </div>
         </template>
       </template>
-      <el-empty v-else description="还没有内容总结，点右上角「开始生成」" :image-size="60" />
+      <el-empty v-else description="还没有内容总结" :image-size="60" />
       <template #footer>
         <span class="ana-foot">
           <span v-if="analysisDirty" class="ana-dirty">有未保存的修改</span>
@@ -324,7 +337,7 @@ const treeData = computed(() => {
       label: `${anchor}（${files.length}）`,
       // 关键修复: 按分片序号升序(_003→_009), 不再跟随修改时间倒序(会把分片排反)
       children: [...files]
-        .sort((a, b) => partNum(a.name) - partNum(b.name) || a.name.localeCompare(b.name))
+        .sort((a, b) => a.name.localeCompare(b.name))  // 文件名含日期时间+序号, 字典序即正确顺序
         .map(f => ({ key: 'f:' + f.path, label: f.label, full: f.full, file: f })),
     })),
   }))
@@ -576,7 +589,7 @@ async function doUpload() {
       }),
     })
     const data = await res.json()
-    if (!res.ok) { ElMessage.error(`投稿失败：${data.error}`); return }
+    if (!res.ok) { ElMessage.error(`投稿失败：${data.error || data.detail || res.status}`); return }
     const job = data.job
     const done = await new Promise((resolve, reject) => {
       const timer = setInterval(async () => {
@@ -613,7 +626,7 @@ async function removeFile(p) {
     if (playPath.value === p) closePlayer()
     refresh()
   } else {
-    ElMessage.error(`删除失败：${data.error || res.status}`)
+    ElMessage.error(`删除失败：${data.error || data.detail || res.status}`)
   }
 }
 
@@ -641,7 +654,7 @@ async function doMerge() {
       body: JSON.stringify({ paths: mergeList.value }),
     })
     const data = await res.json()
-    if (!res.ok) { ElMessage.error(`合并失败：${data.error}`); return }
+    if (!res.ok) { ElMessage.error(`合并失败：${data.error || data.detail || res.status}`); return }
     const job = data.job
     const done = await new Promise((resolve, reject) => {
       const timer = setInterval(async () => {
@@ -675,6 +688,9 @@ const analysisSaving = ref(false)
 const analysisDirty = ref(false)
 const analysisView = ref('edit')
 const analysisOverall = ref('')
+const songOnly = ref(false)
+const textSongsOnly = ref(false)
+const reviewOnly = ref(false)
 
 function fmtTs(s) {
   s = Math.max(0, parseInt(s) || 0)
@@ -697,12 +713,14 @@ function toEditable(segments) {
     type: s.type || 'other',
     title: s.title || '',
     summary: s.summary || '',
+    src: s.src || 'llm',
+    conf: s.conf || '',
   }))
 }
 
 function fromEditable() {
   return analysisSegments.value
-    .map(s => ({ start: parseTs(s.startText), end: parseTs(s.endText), type: s.type, title: s.title.trim(), summary: s.summary.trim() }))
+    .map(s => ({ start: parseTs(s.startText), end: parseTs(s.endText), type: s.type, title: s.title.trim(), summary: s.summary.trim(), src: s.src || 'llm' }))
     .sort((a, b) => a.start - b.start)
 }
 
@@ -727,10 +745,18 @@ function chapterLabel(s) {
 }
 
 function buildPlainText() {
+  const segs = fromEditable()
+  if (textSongsOnly.value) {
+    // 仅歌单模式: 一行一首歌, 发 B站评论区/置顶歌单专用
+    return segs
+      .filter(s => s.type === 'song')
+      .map(s => `${fmtChapterTs(s.start)} \u300a${s.title || '未知曲目'}\u300b${s.summary ? ' ' + s.summary : ''}`)
+      .join('\n')
+  }
   const lines = []
   const overall = analysisOverall.value.trim()
   if (overall) lines.push(overall, '')
-  for (const s of fromEditable()) {
+  for (const s of segs) {
     if (s.type === 'thanks') continue  // 旧数据兼容: 感谢环节不进总结
     lines.push(`${fmtChapterTs(s.start)} ${chapterLabel(s)}`)
   }
@@ -786,7 +812,12 @@ async function loadAnalysis() {
   }
 }
 
-async function startAnalysis() {
+async function startAnalysis(mode = 'full') {
+  if (mode === 'songs' && analysisAnalyzed.value) {
+    try {
+      await ElMessageBox.confirm('歌单模式只保留歌曲时间轴(无闲聊总结)，会覆盖当前内容，确定？', '仅提取歌单', { type: 'warning' })
+    } catch { return }
+  }
   analyzing.value = true
   analysisPct.value = 0
   analysisMsg.value = '启动中…'
@@ -794,7 +825,7 @@ async function startAnalysis() {
     const res = await fetch('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: analysisPath.value }),
+      body: JSON.stringify({ path: analysisPath.value, mode }),
     })
     const data = await res.json()
     if (!res.ok) { ElMessage.error(`启动失败：${data.error}`); return }
@@ -1048,7 +1079,10 @@ body { background: #f4f5f7; margin: 0;
 .ana-foot { display: flex; align-items: center; gap: 8px; width: 100%; }
 .ana-dirty { font-size: 12px; color: #e6a23c; }
 .ana-plain :deep(.el-textarea__inner) { font-family: Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.7; resize: none; }
-.ana-copy-row { display: flex; justify-content: flex-end; margin-top: 8px; }
+.ana-copy-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.ana-song-only { margin-left: 12px; }
+.ana-src-tag { flex: none; }
+.ana-seg-warn { background: #fdf6ec; border-radius: 6px; }
 .ana-ov-row { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; }
 .ana-ov-label { font-size: 12px; color: #8a919f; flex: none; width: 56px; padding-top: 6px; }
 @media (max-width: 768px) {

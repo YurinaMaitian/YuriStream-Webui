@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -38,7 +39,10 @@ if _ENV_FILE.exists():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
-            os.environ.setdefault(_k.strip(), _v.strip().strip("'").strip('"'))
+            _v = _v.strip()
+            if " #" in _v:  # 行内注释: 仅当#前有空格时截断(避免误伤含#的值)
+                _v = _v.split(" #", 1)[0].rstrip()
+            os.environ.setdefault(_k.strip(), _v.strip("'").strip('"'))
 
 
 import main as recorder
@@ -711,6 +715,7 @@ def remove_anchor(url: str, hard: bool = False):
 
 class AnalysisIn(BaseModel):
     path: str
+    mode: str = "full"  # full=完整总结 / songs=仅歌单提取
 
 
 class AnalysisSaveIn(BaseModel):
@@ -747,7 +752,9 @@ def analyze_start(item: AnalysisIn):
     target = _safe_resolve(item.path)
     if target is None:
         return JSONResponse({"error": "文件不存在"}, status_code=404)
-    job = _analysis.start_analysis(target)
+    job = _analysis.start_analysis(
+        target, mode=item.mode if item.mode in ("full", "songs") else "full"
+    )
     return {"ok": True, "job": job}
 
 
@@ -855,6 +862,178 @@ def download(path: str):
     if target is None:
         return JSONResponse({"error": "文件不存在"}, status_code=404)
     return FileResponse(target, filename=target.name)
+
+
+# ---------------- 分片合并（ffmpeg concat demuxer，不重编码） ----------------
+
+
+class MergeIn(BaseModel):
+    paths: list = []
+
+
+_merge_jobs: dict = {}
+_merge_lock = threading.Lock()
+
+
+def _probe_duration(p: Path) -> float:
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(p),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return float(r.stdout.strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def _merge_worker(job: str, sources: list, out_path: Path) -> None:
+    total = sum(_probe_duration(p) for p in sources)
+    listfile = out_path.with_suffix(".concat.txt")
+
+    def _set(**kw):
+        with _merge_lock:
+            _merge_jobs[job].update(kw)
+
+    try:
+        # concat demuxer 的清单格式: file '路径'(单引号转义)
+        esc = lambda p: str(p).replace("'", "'\\''")
+        listfile.write_text(
+            "".join(f"file '{esc(p)}'\n" for p in sources), encoding="utf-8"
+        )
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(listfile),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(out_path),
+        ]
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        lf = open(log_dir / f"merge_{job}.log", "w", encoding="utf-8", errors="ignore")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=lf, text=True)
+        for line in proc.stdout:
+            if line.startswith("out_time_us="):
+                try:
+                    done_s = int(line.split("=", 1)[1]) / 1_000_000
+                except Exception:
+                    done_s = 0.0
+                _set(pct=int(100 * done_s / total) if total > 0 else -1)
+        proc.wait()
+        lf.close()
+        if (
+            proc.returncode != 0
+            or not out_path.exists()
+            or out_path.stat().st_size == 0
+        ):
+            tail = (log_dir / f"merge_{job}.log").read_text(
+                encoding="utf-8", errors="ignore"
+            )[-300:]
+            raise RuntimeError(
+                f"ffmpeg 退出码 {proc.returncode}: {tail.strip() or '无日志'}"
+            )
+        _set(status="done", pct=100, path=str(out_path.relative_to(_record_root())))
+    except Exception as e:
+        _set(status="failed", msg=str(e))
+    finally:
+        listfile.unlink(missing_ok=True)
+
+
+@app.post("/api/merge")
+def merge_start(item: MergeIn):
+    """有序拼接分片: -f concat + -c copy, 不重编码、无损、快"""
+    if len(item.paths) < 2:
+        return JSONResponse({"error": "至少需要 2 个文件"}, status_code=400)
+    sources = []
+    for p in item.paths:
+        t = _safe_resolve(p)
+        if t is None:
+            return JSONResponse({"error": f"文件不存在: {p}"}, status_code=404)
+        sources.append(t)
+    first = sources[0]
+    if len({s.suffix.lower() for s in sources}) > 1:
+        return JSONResponse({"error": "不同格式的文件不能合并"}, status_code=400)
+    base = re.sub(r"_\d{3}(?=\.[^.]+$)", "", first.stem)  # 去 _003 分片尾缀
+    out_path = first.parent / f"{base}_merged.mp4"
+    job = uuid.uuid4().hex[:12]
+    with _merge_lock:
+        _merge_jobs[job] = {"status": "running", "pct": 0, "msg": "合并中…"}
+    threading.Thread(
+        target=_merge_worker, args=(job, sources, out_path), daemon=True
+    ).start()
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/merge/{job}")
+def merge_status(job: str):
+    with _merge_lock:
+        j = _merge_jobs.get(job)
+    if not j:
+        return JSONResponse({"error": "任务不存在或已过期"}, status_code=404)
+    return dict(j)
+
+
+# ---------------- 录播删除（回收站，7 天自动清除） ----------------
+
+
+@app.delete("/api/recordings")
+def recording_delete(path: str, confirm: bool = False):
+    if not confirm:
+        return JSONResponse({"error": "缺少确认参数"}, status_code=400)
+    target = _safe_resolve(path)
+    if target is None:
+        return JSONResponse({"error": "文件不存在"}, status_code=404)
+    trash = _record_root() / ".trash"
+    trash.mkdir(exist_ok=True)
+    now = time.time()
+    for old in trash.iterdir():
+        try:
+            if now - old.stat().st_mtime > 7 * 86400:
+                old.unlink()
+        except Exception:
+            pass
+    dest = trash / f"{int(now)}_{target.name}"
+    target.rename(dest)
+    return {"ok": True, "trashed": target.name}
+
+
+# ---------------- B站相关（风控期间占位，返回明确提示） ----------------
+
+
+@app.get("/api/bili/cookie")
+def bili_cookie():
+    return {"set": False}
+
+
+@app.post("/api/bilibili/upload")
+def bili_upload_stub():
+    return JSONResponse(
+        {
+            "error": "B站上传接口未部署：服务器IP正被B站风控，解封后建议接入 biliup-rs（见 PLAN.md）"
+        },
+        status=503,
+    )
 
 
 if __name__ == "__main__":
