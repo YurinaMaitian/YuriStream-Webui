@@ -165,3 +165,11 @@ cython_debug/
 #.idea/
 
 backup_config/
+
+lyrics/
+
+play_cache/
+
+*.wav
+
+web-ui/.vscode/
