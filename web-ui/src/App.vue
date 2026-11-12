@@ -236,11 +236,15 @@
           <div v-for="(seg, i) in analysisSegments" :key="i"
              v-show="(!songOnly || seg.type === 'song') && (!reviewOnly || seg.conf !== 'high')"
              class="ana-seg" :class="{ 'ana-seg-warn': seg.conf && seg.conf !== 'high' }">
-            <el-button :icon="CaretRight" circle size="small" title="从此处播放" @click="playSeg(seg)" />
+            <el-button link size="small" class="ana-seek" title="从头播放" @click="playSegAt(seg, 1)">头</el-button>
+            <el-button link size="small" class="ana-seek" title="从中点播放(查段内换歌)" @click="playSegAt(seg, 0.5)">中</el-button>
+            <el-button link size="small" class="ana-seek" title="播放结尾前10秒(查段尾吞歌)" @click="playSegAt(seg, -10)">尾</el-button>
             <el-input v-model="seg.startText" size="small" class="ana-time" placeholder="00:00" @change="markDirty" />
             <el-button link size="small" class="ana-nudge" title="开始 -10 秒" @click="nudgeSeg(seg, 'startText', -10)">‹</el-button>
+            <el-button link size="small" class="ana-nudge" title="开始 +10 秒" @click="nudgeSeg(seg, 'startText', 10)">›</el-button>
             <span class="ana-dash">–</span>
             <el-input v-model="seg.endText" size="small" class="ana-time" placeholder="03:15" @change="markDirty" />
+            <el-button link size="small" class="ana-nudge" title="结束 -10 秒" @click="nudgeSeg(seg, 'endText', -10)">‹</el-button>
             <el-button link size="small" class="ana-nudge" title="结束 +10 秒" @click="nudgeSeg(seg, 'endText', 10)">›</el-button>
             <el-select v-model="seg.type" size="small" class="ana-type" @change="markDirty">
               <el-option label="🎵 唱歌" value="song" />
@@ -253,6 +257,10 @@
             <el-tag v-if="seg.type === 'song'" size="small" effect="plain" class="ana-src-tag"
                     :type="seg.conf === 'high' ? 'success' : seg.conf === 'low' ? 'danger' : 'warning'">
               {{ seg.src === 'reco' ? '识别' : '猜测' }}{{ seg.conf === 'low' ? '·存疑' : seg.conf === 'mid' ? '·待审' : '' }}
+            </el-tag>
+            <el-tag v-if="seg.type === 'song' && (seg.musicBreaks || 0) >= 2" size="small" type="warning" effect="dark"
+                    class="ana-src-tag" :title="`段内检测到 ${seg.musicBreaks} 个音乐段, 疑似跨歌, 建议点「尾」听结尾前10秒`">
+              ⚠{{ seg.musicBreaks }}段音乐
             </el-tag>
             <el-input v-model="seg.summary" size="small" class="ana-summary" placeholder="一句话总结（可选）" @change="markDirty" />
             <el-button :icon="Delete" circle size="small" text type="danger" title="删除该段" @click="delSeg(i)" />
@@ -722,12 +730,14 @@ function toEditable(segments) {
     summary: s.summary || '',
     src: s.src || 'llm',
     conf: s.conf || '',
+    weak: s.weak || false,
+    musicBreaks: s.music_breaks || 0,
   }))
 }
 
 function fromEditable() {
   return analysisSegments.value
-    .map(s => ({ start: parseTs(s.startText), end: parseTs(s.endText), type: s.type, title: s.title.trim(), summary: s.summary.trim(), src: s.src || 'llm' }))
+    .map(s => ({ start: parseTs(s.startText), end: parseTs(s.endText), type: s.type, title: s.title.trim(), summary: s.summary.trim(), src: s.src || 'llm', conf: s.conf || '', weak: s.weak || false, music_breaks: s.musicBreaks || 0 }))
     .sort((a, b) => a.start - b.start)
 }
 
@@ -889,10 +899,16 @@ async function saveAnalysisEdits() {
   } finally { analysisSaving.value = false }
 }
 
-async function playSeg(seg) {
+function playSegAt(seg, where) {
+  // where: 1=段开头, 0.5=段中点, -10=结尾前10秒; 短段自动退化到开头
   if (playPath.value !== analysisPath.value) play(analysisPath.value)
-  await nextTick()
-  if (videoEl.value) videoEl.value.currentTime = parseTs(seg.startText) + 0.3
+  const st = parseTs(seg.startText)
+  const en = parseTs(seg.endText)
+  let t
+  if (where === 1) t = st + 0.3
+  else if (where === 0.5) t = (st + en) / 2
+  else t = Math.max(st + 0.3, en + where)
+  nextTick(() => { if (videoEl.value) videoEl.value.currentTime = t })
 }
 
 // ---------- 投稿简介导出 (B站转载格式, 复制即用) ----------
@@ -947,15 +963,30 @@ function fmtDuration(s) {
   return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`
 }
 
+function onSpaceToggle(e) {
+  // 全局空格暂停/播放: 输入框/文本域内不劫持(打字时空格照常),
+  // 其余页面任意位置(含按钮聚焦时)空格都作用于视频
+  if (e.code !== 'Space') return
+  const t = e.target
+  const tag = (t && t.tagName) || ''
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return
+  if (!videoEl.value) return
+  e.preventDefault()
+  if (videoEl.value.paused) videoEl.value.play().catch(() => {})
+  else videoEl.value.pause()
+}
+
 onMounted(() => {
   refresh()
   timer = setInterval(() => { nowTs.value = Date.now(); refresh() }, 5000)
   window.addEventListener('resize', onResize)
+  window.addEventListener('keydown', onSpaceToggle)
 })
 
 onUnmounted(() => {
   clearInterval(timer)
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('keydown', onSpaceToggle)
   if (hls) hls.destroy()
 })
 </script>
@@ -1096,6 +1127,8 @@ body { background: #f4f5f7; margin: 0;
 .ana-dash { color: #a8adb8; flex: none; }
 .ana-nudge { flex: none; padding: 0 1px !important; font-size: 14px; color: #c0c4cc; }
 .ana-nudge:hover { color: var(--el-color-primary); }
+.ana-seek { flex: none; padding: 0 2px !important; font-size: 12px; color: #909399; }
+.ana-seek:hover { color: var(--el-color-primary); }
 .ana-type { width: 104px; flex: none; }
 .ana-title { flex: 1.2; min-width: 0; }
 .ana-summary { flex: 2; min-width: 0; }

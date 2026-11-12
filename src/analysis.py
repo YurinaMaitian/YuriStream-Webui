@@ -109,6 +109,55 @@ v7(2026-10-31)改动(根因修复: 同代码两次跑出天差地别歌单的问
      《Trio Sonata...》类垃圾标题不再漏网(LLM high确认原标题的除外)
  40. 二轮/补漏识别先查.songs.json缓存命中再发网络请求: 重跑接近零成本
  41. 巨型段conf上限mid(拆分失败兜底); 切片质量自检(>=2个巨型段时提示重掷)
+
+v8(2026-11-02)改动(SenseVoice 根因修复 + 兜底补齐, 依据当日实跑日志与探针定案):
+ 42. SenseVoice 路径从未生效的根因: SenseVoiceSmall 架构上不支持时间戳预测,
+     funasr 1.4.17 结果 keys 恒为 ['key','text'](探针三种变体一致)。原
+     _transcribe_sensevoice 每次必抛"未返回有效时间戳" → 静默回落 whisper,
+     且歌词二遍不在兜底分支 → 歌词层长期裸奔。重写为 fsmn-vad 独立切段 +
+     段 clip 批量转写, VAD 边界即时间戳(下游只消费段边界, 粒度无损)。
+     tools/test_sensevoice.py 可复验该结论。
+ 43. 歌词二遍与 ASR 提供方解耦: 检测+二遍抽成 _music_second_pass, sensevoice
+     /whisper 任一路径转写后统一调用——再有任何 ASR 异常, 歌词质量都有保障。
+ 44. SenseVoice 情绪/事件标记剥除: rich transcription 会把 <|HAPPY|>/<|BGM|> 等
+     转成 emoji(😊🎙️), 本pipeline不需要 mood 且 emoji 污染压缩率/检索/LLM输入。
+ 45. song 段写入 music_breaks 字段(段内音乐段断点数): >=2 标"疑似跨歌"徽标,
+     前端提示人工听段尾——吞歌失败点不产生任何时间轴行, 必须给人留审核入口。
+ 46. 审核流水 review_journal.jsonl: 每次自动生成/人工对齐各记一条(系统产出 +
+     人工真值 + 学到的补丁/别名), 这是项目的测试集档案, 供离线评估与回放。
+
+v9(2026-11-03)改动(测试集驱动, 依据 case-log C-09/C-10/C-11 与第五场非典型样本):
+ 47. 对齐占用守卫(C-10): 起点对齐选边界时跳过 ±5s 内已被其他歌段起点占用的
+     候选, 防止"57:02 被提前对齐拉回 56:22 与《意外》撞车、意外被重叠整形截成
+     1 秒段"这类事故。
+ 48. 折叠 v2(C-11 收紧版): _collapse_fragment_rows 只折"起点±5s 且 终点±10s
+     且同名(含同为未知)"的精确重复副本; 终点不同一律保留——可能是真两首 ABB
+     (意外20s+关键词3:38同起点不同终点), 数据层不误杀。删除权只属于人工补丁。
+ 49. 短段降级不删除: <MIN_SONG_SECONDS(默认12,env可调)强制 conf=low + short
+     标记保留在数据层; 12-45s 无证据段同样标 low。删除只发生在导出层(bili_intro
+     跳过 short 行)与人工补丁——硬删不可逆且错误率受制于上游切边质量。
+ 50. 别名防投毒(C-09 两次实踩后机器化): 学习全局 hum 别名前检查"旧名是否在本场
+     final_segments 其他行以原名保留"(真唱《天天》与误名《天天》共存场景),
+     是则跳过全局别名、只记逐视频补丁(补丁层天然防投毒)。
+
+v10(2026-11-11)改动(四规则收官批次, 依据第6-11场测试集两次以上实害/逃逸):
+ 51. C-06 同名护栏修复: 阻断翻案时把被阻断目标塞进 cands(一键恢复), 不再让行裸奔到
+     "可疑标题降级"变成无信息未知(情歌/当冬夜渐暖两次实害)。
+ 52. 歌词双信号检测: 段检索 top1/top2 双高分(>=0.35)异名且段>3min → multi_signal
+     标记(夜车案唯一不依赖伴奏间断/识别命中的吞歌探测器), 计入徽标提示人工。
+ 53. C-05 聚簇降级: 5分钟窗口内>=3行 fp rec<50 噪声 → 合并为一行(跨度取并集)+conf=low
+     +cluster 标记——减行不减覆盖, 出口保留待审不自动删(洪流藏真唱: 如果可以/叹云兮案)。
+ 54. C-08 PK 归属: 转写层 _PK_RE 窗口(±60s合并)内的歌段打 pk 标记+conf 封顶 mid——
+     识别内容是对的, 错的是归属(对面主播唱的), 不抑制识别。
+ 55. 高置信跳过: 歌词判定目标过滤掉识别层已高置信段(fp rec>=50 / hum rec>=1000),
+     输入省40-60%不伤准确性。
+ 56. 收尾输出命名归因统计行(每场日志自动回答"LLM 贡献多大")。
+
+v10.2(2026-11-12)改动(v10 验证场两处修正):
+ 57. C-13 修复: 聚簇合并后补 _resolve_overlaps——并集跨度不再盖住区间内真实歌段
+     (唯一重叠困惑案: 噪声大行被真实歌段切断)。
+ 58. 双信号降噪: rec>=50000 的强命中段跳过双信号判定(v10验证场误报4/5, 误报全来自
+     强命中段; 强命中=已确定是这首, 无跨歌悬念)。
 """
 
 import asyncio
@@ -159,6 +208,14 @@ _analysis_lock = (
     threading.Lock()
 )  # 全局分析互斥: 同一时刻只允许一个分析任务(防并发污染缓存)
 _model_cache: dict = {}
+
+
+# SenseVoice rich transcription 会把情绪/事件标记(<|HAPPY|>/<|BGM|>等)转成 emoji,
+# 歌单提取不需要 mood 信息, 且 emoji 污染压缩率/歌词检索/LLM 输入 → 统一剥除
+_SV_META_EMOJI_RE = re.compile(
+    "[\U0001f000-\U0001faff\U00002600-\U000027bf"
+    "\U0001f1e6-\U0001f1ff\U00002b00-\U00002bff]+"
+)
 
 
 class AnalysisError(RuntimeError):
@@ -306,45 +363,123 @@ def _get_sensevoice_model():
     return _model_cache[key]
 
 
+def _get_vad_segments(
+    wav: Path, max_seg_s: float = 30.0, max_gap_s: float = 1.0
+) -> list:
+    """fsmn-vad 切语音段并合并成转写 clip, 返回 [(start_s, end_s), ...]
+
+    v8: SenseVoiceSmall 不支持时间戳预测(见 _transcribe_sensevoice docstring),
+    转写段的时间戳改由 VAD 边界提供(原实现预期的正是这个粒度)。
+    fsmn-vad 会切出大量 1~3s 碎段(2小时约3000+), 先按间隙合并成
+    <=max_seg_s 的 clip 再送转写——对应原 merge_vad(15s) 的语义,
+    同时把 SenseVoiceSmall 的调用次数压到几百次(它 batch_size 只能为 1)。
+    """
+    from funasr import AutoModel
+
+    key = ("fsmn-vad",)
+    if key not in _model_cache:
+        _model_cache[key] = AutoModel(
+            model="fsmn-vad",
+            model_revision="master",
+            device="cpu",
+            disable_update=True,
+        )
+    vad = _model_cache[key]
+    res = vad.generate(input=str(wav))
+    raw = (res[0].get("value") or []) if res else []
+    raw = sorted((s / 1000.0, e / 1000.0) for s, e in raw if e > s)
+    # 相邻段合并(间隙<=max_gap_s 且合并后不超 max_seg_s), 生成转写 clip
+    merged: list = []
+    for s, e in raw:
+        if merged and s - merged[-1][1] <= max_gap_s and e - merged[-1][0] <= max_seg_s:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
 def _transcribe_sensevoice(wav: Path) -> list:
-    """SenseVoiceSmall 全量快转(2核CPU友好, 中文闲聊准), 带 VAD 段级时间戳"""
+    """VAD 切 clip → SenseVoiceSmall 逐 clip 快转(2核CPU友好, 中文闲聊准)。
+
+    v8 重写: 原实现依赖 funasr 给 SenseVoice 结果附加 timestamp——该能力
+    不存在(SenseVoiceSmall 无时间戳头, funasr 1.4.17 探针 keys 恒为
+    ['key','text']), 导致此路径自上线起每次必抛 AnalysisError 静默回落
+    whisper, 歌词二遍随之失效(2026-11-02 事故根因)。
+    现改为 fsmn-vad 切 clip(见 _get_vad_segments), VAD 边界即时间戳;
+    下游只消费段边界(原代码也只取 ts[0][0]/ts[-1][1]), 粒度无损。
+    注意: SenseVoiceSmall 在 funasr 1.4.17 下 batch_size 必须为 1
+    (推理实现不支持批处理), 故逐 clip 调用; clip 已由 _get_vad_segments
+    合并到 <=30s, 调用次数可控(2小时约300~500次)。
+    """
     from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
+    clips_timeline = _get_vad_segments(wav)
+    if not clips_timeline:
+        raise AnalysisError("VAD 未检出任何语音段(纯音乐直播或文件无音轨)")
+    _log(f"VAD 切段完成: {len(clips_timeline)} 段, 送 SenseVoice 逐段转写…")
+
     model = _get_sensevoice_model()
-    res = model.generate(
-        input=str(wav),
-        cache={},
-        language="zh",
-        use_itn=True,
-        batch_size=int(os.environ.get("SV_BATCH", "4") or 4),
-        merge_vad=True,
-        merge_length_s=15,
-    )
-    segs = []
-    for r in res:
-        ts = r.get("timestamp") or []
-        if ts:
-            st, en = ts[0][0] / 1000.0, ts[-1][1] / 1000.0
-        else:
-            st = en = 0.0
-        text = rich_transcription_postprocess(r.get("text", "")).strip()
-        if not text:
-            continue
-        segs.append(
-            {
-                "start": round(st, 2),
-                "end": round(en, 2),
-                "text": text,
-                "cr": _text_cr(text),
-                "lp": 0.0,
-            }
-        )
-    if not segs or all(sg["end"] <= 0 for sg in segs):
-        raise AnalysisError("SenseVoice 未返回有效时间戳")
-    return segs
+    clip_dir = CACHE_DIR / "sv_clips"
+    clip_dir.mkdir(parents=True, exist_ok=True)
 
+    out: list = []
+    try:
+        for n, (s, e) in enumerate(clips_timeline):
+            clip = clip_dir / f"sv_{n:05d}.wav"
+            r = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    f"{s:.2f}",
+                    "-t",
+                    f"{e - s:.2f}",
+                    "-i",
+                    str(wav),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    str(clip),
+                ],
+                capture_output=True,
+            )
+            if r.returncode != 0 or not clip.exists():
+                continue
+            try:
+                res = model.generate(
+                    input=str(clip),
+                    cache={},
+                    language="zh",
+                    use_itn=True,
+                    batch_size=1,  # SenseVoiceSmall 只支持单条推理
+                )
+            finally:
+                clip.unlink(missing_ok=True)
+            if not res:
+                continue
+            text = rich_transcription_postprocess(res[0].get("text", "")).strip()
+            text = _SV_META_EMOJI_RE.sub("", text).strip()  # 去情绪/事件emoji
+            if not text:
+                continue
+            out.append(
+                {
+                    "start": round(s, 2),
+                    "end": round(e, 2),
+                    "text": text,
+                    "cr": _text_cr(text),
+                    "lp": 0.0,
+                }
+            )
+            if (n + 1) % 50 == 0:
+                _log(f"SenseVoice 转写: {n + 1}/{len(clips_timeline)} 段")
+    finally:
+        for p in clip_dir.glob("sv_*.wav"):
+            p.unlink(missing_ok=True)
 
-_known_titles_cache: list | None = None
+    if not out:
+        raise AnalysisError("SenseVoice 未返回任何文本")
+    return out
 
 
 def _known_titles() -> str:
@@ -489,6 +624,28 @@ def _transcribe_whisper(wav: Path) -> list:
     return segs
 
 
+def _music_second_pass(wav: Path, video: Path, segs: list) -> list:
+    """inaSpeechSegmenter 音乐段检测 + whisper 歌词二遍。
+
+    v8: 与 ASR 提供方解耦, sensevoice / whisper 任一路径转写后统一调用。
+    原实现只在 sensevoice 分支接二遍, whisper 兜底路径裸奔——SenseVoice
+    长期静默失效期间歌词层无质量保障(2026-11-02 实跑日志实锤, 歌词LLM
+    33 段仅 9 段出判定)。
+    """
+    if not _env_int("MUSIC_SEG_ENABLE", 1):
+        return segs
+    try:
+        _log("[analysis] inaSpeechSegmenter 音乐段检测中(静默, 2小时音频约10-30分钟)…")
+        music_segs = _detect_music_segments(wav, _music_cache_path(video))
+        _log(f"音乐段检测完成: {len(music_segs)} 段")
+    except Exception as e:
+        _log(f"音频级音乐段检测不可用({e}), 跳过歌词二遍")
+        return segs
+    if music_segs:
+        segs = _whisper_second_pass(wav, segs, music_segs)
+    return segs
+
+
 def _transcribe(wav: Path, txt: Path, video: Path) -> list:
     # 转写缓存命中则直接返回(重新生成时省掉最耗时的 ASR 阶段)
     if txt.exists():
@@ -503,34 +660,24 @@ def _transcribe(wav: Path, txt: Path, video: Path) -> list:
                 pass
         if segs:
             return segs
-    # ASR_PROVIDER=sensevoice: SenseVoice 全量快转 + music 段 whisper 二遍; 异常自动回落 whisper
+    # ASR_PROVIDER=sensevoice: VAD切段+SenseVoice 快转; 异常自动回落 whisper
     if os.environ.get("ASR_PROVIDER", "sensevoice").strip() == "sensevoice":
         try:
             segs = _transcribe_sensevoice(wav)
             _log(f"SenseVoice 快转完成: {len(segs)} 段")
-            # 先落盘: 后续阶段卡住/中断时不丢失转写结果
+            # 先落盘: 后续阶段卡住/中断时不丢失底稿转写
             txt.parent.mkdir(parents=True, exist_ok=True)
             txt.write_text(
                 "\n".join(json.dumps(sg, ensure_ascii=False) for sg in segs),
                 encoding="utf-8",
             )
-            music_segs = []
-            if _env_int("MUSIC_SEG_ENABLE", 1):
-                try:
-                    _log(
-                        "[analysis] inaSpeechSegmenter 音乐段检测中(静默, 2小时音频约10-30分钟)…"
-                    )
-                    music_segs = _detect_music_segments(wav, _music_cache_path(video))
-                    _log(f"音乐段检测完成: {len(music_segs)} 段")
-                except Exception as e:
-                    _log(f"音频级音乐段检测不可用({e}), 跳过歌词二遍")
-            if music_segs:
-                segs = _whisper_second_pass(wav, segs, music_segs)
         except Exception as e:
             _log(f"SenseVoice 不可用({e}), 回落 faster-whisper")
             segs = _transcribe_whisper(wav)
     else:
         segs = _transcribe_whisper(wav)
+    # 歌词二遍: 两条 ASR 路径统一接(见 _music_second_pass docstring)
+    segs = _music_second_pass(wav, video, segs)
     txt.parent.mkdir(parents=True, exist_ok=True)
     txt.write_text(
         "\n".join(json.dumps(sg, ensure_ascii=False) for sg in segs), encoding="utf-8"
@@ -632,7 +779,16 @@ def _normalize_segment(raw: dict) -> dict | None:
         "conf": str(raw.get("conf", "")),  # 置信度分层: high/mid/low
     }
     # 证据字段(engine/rec_times/cands)若存在必须保留: 丢失后置信分层会把 reco 段误判为 low
-    for k in ("engine", "rec_times", "cands"):
+    for k in (
+        "engine",
+        "rec_times",
+        "cands",
+        "music_breaks",
+        "short",
+        "multi_signal",
+        "pk",
+        "cluster",
+    ):
         if k in raw:
             seg[k] = raw[k]
     return seg
@@ -1192,9 +1348,10 @@ def _load_recog_alias() -> dict:
     return _recog_alias_cache
 
 
-def _learn_alias_from_edits(old: dict, new_segs: list) -> None:
+def _learn_alias_from_edits(old: dict, new_segs: list) -> dict:
     """人工在前端把识别错的歌名改对并保存时, 自动学习为别名(仅 humming 误配):
-    她的编曲/跑调稳定, 同一误配每场复现, 学一次永久纠正"""
+    她的编曲/跑调稳定, 同一误配每场复现, 学一次永久纠正。
+    返回本次学到的别名(供审核流水记录)"""
     try:
         old_map = {
             int(s["start"]): s
@@ -1218,6 +1375,12 @@ def _learn_alias_from_edits(old: dict, new_segs: list) -> None:
                 and t_new != "未知曲目"
                 and o.get("src") == "reco"
             ):
+                if t_old in new_titles_kept:
+                    _log(
+                        f"别名学习跳过(旧名《{t_old}》本场仍作为其他行歌名保留,"
+                        " 全局学习会投毒)——只记逐视频补丁"
+                    )
+                    continue
                 if o.get("engine") == "fp":
                     # fp 误配是位置性噪声: 只锁定本场该时间点附近生效,
                     # 防止同一错名在别的位置掩盖别的歌(幻影牵丝戏惨案)
@@ -1231,7 +1394,7 @@ def _learn_alias_from_edits(old: dict, new_segs: list) -> None:
                     # hum 误配由主播声线/跑调习惯决定, 每场复现: 全局生效
                     learned[t_old] = t_new
         if not learned:
-            return
+            return {}
         p = Path("lyrics") / "recog_alias.json"
         alias = _load_recog_alias()
         changed = False
@@ -1251,8 +1414,10 @@ def _learn_alias_from_edits(old: dict, new_segs: list) -> None:
                 f"别名表自动学习 {len(learned)} 条: "
                 + "; ".join(f"《{k}》→《{v}》" for k, v in learned.items())
             )
+        return learned
     except Exception as e:
         _log(f"别名学习失败({e}), 忽略")
+        return {}
 
 
 def _apply_recog_alias(merged: list) -> list:
@@ -1346,6 +1511,14 @@ def _learn_patches_from_edits(old: dict, new_segs: list, video: Path) -> None:
             changed = True
 
         matched_new: set = set()
+        # v9 别名防投毒(C-09): 旧名若在本场仍作为其他行的最终歌名保留
+        # (真唱《天天》与误名《天天》共存场景), 学全局别名会毒化未来真《天天》
+        # 的识别——跳过全局别名, 改名由逐视频补丁承接(补丁层天然防投毒)
+        new_titles_kept = {
+            ((s.get("title") or "").strip() or "未知曲目")
+            for s in new_songs
+            if s.get("type") == "song"
+        }
         for o in old_songs:
             o_start = int(o["start"])
             o_title = (o.get("title") or "").strip() or "未知曲目"
@@ -1992,9 +2165,26 @@ _LYRIC_ID_PROMPT = (
 def _identify_songs_by_lyrics(job_id: str, merged: list, transcript: list) -> tuple:
     """歌词辅助识别: 转写文本 → 本地歌词库检索top3候选 → LLM结合候选做判断。
     LLM 不可用时, 检索均分≥0.6 的 top1 直接采信。依赖模型内置歌曲知识, 无需联网。"""
-    targets = [sg for sg in merged if sg["type"] == "song"]
+
+    def _already_sure(sg: dict) -> bool:
+        """v10: 识别层已高置信命名的段不需要歌词仲裁(fp rec>=50 / hum rec>=1000
+        且标题健康且非弱命中)——名字已自动采纳, 再送三票是纯烧钱。"""
+        if sg.get("src") != "reco" or sg.get("weak"):
+            return False
+        rt = int(sg.get("rec_times") or 0)
+        if sg.get("engine") == "fp" and rt >= 50:
+            return _sane_title(sg.get("title") or "")
+        if sg.get("engine") == "hum" and rt >= 1000:
+            return _sane_title(sg.get("title") or "")
+        return False
+
+    _all_songs = [sg for sg in merged if sg["type"] == "song"]
+    targets = [sg for sg in _all_songs if not _already_sure(sg)]
+    _skipped_sure = len(_all_songs) - len(targets)
+    if _skipped_sure:
+        _log(f"歌词判定跳过已高置信段: {_skipped_sure} 首(识别层已定名, 省三票请求)")
     if not targets:
-        return {}
+        return {}, {}, 0, _skipped_sure
     _log(f"歌词识别阶段: {len(targets)} 段待判定")
     cands_map: dict = {}
     snippets = []
@@ -2124,7 +2314,7 @@ def _identify_songs_by_lyrics(job_id: str, merged: list, transcript: list) -> tu
         _log(
             f"歌词识别[{int(start // 60):02d}:{int(start % 60):02d}] 文本{ln}字 → {r.get('title', '无结果')}({r.get('confidence', '-')})"
         )
-    return out_map, cands_map
+    return out_map, cands_map, len(targets), _skipped_sure
 
 
 def _sane_title(title: str) -> bool:
@@ -2227,25 +2417,40 @@ def _align_song_starts_to_music(merged: list, music_segs: list) -> list:
     ①提前对齐: 命中窗口中点切出的边界常偏进歌里几十秒(关键词标9:56, 实际9:19开唱),
       而 inaSpeechSegmenter 的音乐起点与真实开唱只差秒级——以它为准;
     ②推后对齐(ALIGN_LATER_MAX, 默认120s, 0=关闭): 段起点落在纯口播区
-      (不在任何音乐段内)且开唱在阈值内时, 起点推到音乐起点——主播先报歌名、
-      回几句弹幕才开唱的场景, 章节不该从聊天开始(v8 实测: 用户手动后挪了
-      7 个起点, 幅度 22~107s, 全部符合这个模式)。推后只推到音乐段起点,
-      绝不推进歌里; 微调(<6s)不动, 避免时间戳抖动"""
+      (不在任何音乐段内)且开唱在阈值内时, 起点推到音乐起点;
+    v9 占用守卫(C-10): 候选边界 ±5s 内已有其他歌段起点时跳过该候选(撞车则取
+    下一边界或放弃)——防止"关键词 57:02 被拉回 56:22 与《意外》同起点、
+    意外被重叠整形截成 1 秒段"这类事故。
+    微调(<6s)不动, 避免时间戳抖动。
+    """
     if not music_segs:
         return merged
     starts = sorted(float(m["start"]) for m in music_segs)
     later_max = _env_int("ALIGN_LATER_MAX", 120)
+    # v9: 占用表(所有歌段原始起点); 对齐成功也即时登记, 防连续两行拉向同一空位
+    occupied = {int(sg["start"]) for sg in merged if sg.get("type") == "song"}
+
+    def _free(s: float, self_start: int) -> bool:
+        return all(abs(int(s) - o) > 5 for o in occupied if o != self_start)
+
     for sg in merged:
         if sg["type"] != "song" or not (sg.get("title") or "").strip():
             continue
-        cand = [s for s in starts if 0 < sg["start"] - s <= 45 and s < sg["end"] - 10]
+        self_start = int(sg["start"])
+        cand = [
+            s
+            for s in starts
+            if 0 < sg["start"] - s <= 45 and s < sg["end"] - 10 and _free(s, self_start)
+        ]
         if cand:
             new_start = int(max(cand))  # 离段起点最近(最晚)的音乐起点
             _log(
                 f"起点对齐音乐段: {fmt_ts(sg['start'])}→{fmt_ts(new_start)}"
                 f" 《{sg['title']}》"
             )
+            occupied.discard(self_start)
             sg["start"] = new_start
+            occupied.add(new_start)
             continue
         if later_max <= 0:
             continue
@@ -2256,15 +2461,21 @@ def _align_song_starts_to_music(merged: list, music_segs: list) -> list:
         ):
             continue
         nxt = [
-            s for s in starts if 6 < s - sg["start"] <= later_max and s < sg["end"] - 10
+            s
+            for s in starts
+            if 6 < s - sg["start"] <= later_max
+            and s < sg["end"] - 10
+            and _free(s, self_start)
         ]
         if nxt:
-            new_start = int(min(nxt))  # 段起点之后第一个音乐起点
+            new_start = int(min(nxt))  # 段起点之后第一个空闲音乐起点
             _log(
                 f"起点对齐音乐段(推后{new_start - sg['start']}s): "
                 f"{fmt_ts(sg['start'])}→{fmt_ts(new_start)} 《{sg['title']}》"
             )
+            occupied.discard(self_start)
             sg["start"] = new_start
+            occupied.add(new_start)
     return merged
 
 
@@ -2298,6 +2509,33 @@ def _absorb_shadowed_unknowns(merged: list) -> list:
     if drop:
         merged = [sg for sg in merged if id(sg) not in drop]
     return merged
+
+
+def _collapse_fragment_rows(segs: list, start_tol: int = 5, end_tol: int = 10) -> list:
+    """精确重复副本折叠(v9/C-11 收紧版): 起点±start_tol 且 终点±end_tol 且同名
+    (含同为"未知曲目")的行, 视为同一音频被拆分/去重链复制的副本, 保留首条。
+
+    刻意只折"同起点+同终点"的精确重复: 终点不同的同起点行可能是真两首
+    (ABB 结构——意外20s + 关键词3:38 同起点不同终点), 一律保留交人工。
+    人工补丁(patched)行永不折叠。删除权只属于人工补丁, 数据层不误杀。
+    """
+    seen: set = set()
+    out: list = []
+    for sg in sorted(segs, key=lambda x: (x["start"], x["end"])):
+        if sg.get("type") == "song" and not sg.get("patched"):
+            key = (
+                int(sg["start"]) // start_tol,
+                int(sg["end"]) // end_tol,
+                (sg.get("title") or "").strip(),
+            )
+            if key in seen:
+                _log(
+                    f"折叠重复副本: {fmt_ts(sg['start'])} 《{sg.get('title') or '未知曲目'}》"
+                )
+                continue
+            seen.add(key)
+        out.append(sg)
+    return out
 
 
 def _resolve_overlaps(merged: list) -> list:
@@ -2338,6 +2576,23 @@ def _arbitrate_titles(merged: list, lyric_ids: dict, cands_map: dict) -> list:
             sg["cands"] = [
                 {"title": c["title"], "score": c["score"]} for c in cands[:3]
             ]
+            # v10 歌词双信号: top1/top2 双高分异名 = 跨歌的数学证据(夜车案:
+            # 不依赖伴奏间断与识别命中), 标记供徽标与人工拆分
+            if (
+                len(cands) >= 2
+                and cands[0]["score"] >= 0.35
+                and cands[1]["score"] >= 0.35
+                and cands[0]["title"] != cands[1]["title"]
+                and sg["end"] - sg["start"] > 180
+                # v10.2: 强命中段(rec>=5万)已确定是这首, 无跨歌悬念,
+                # 检索双高分多为共享词汇噪声(v10验证场误报4/5全来自强命中段)
+                and int(sg.get("rec_times") or 0) < 50000
+            ):
+                sg["multi_signal"] = [cands[0]["title"], cands[1]["title"]]
+                _log(
+                    f"歌词双信号(疑似跨歌): {pos} 《{cands[0]['title']}》vs"
+                    f"《{cands[1]['title']}》(双高分异名)"
+                )
         # 双重确认(v5): LLM high 单独不构成翻案证据, 需满足:
         # ①检索top1同歌支持, 或②原标题不可信(非法/未知/低rec指纹);
         # 且 翻案目标≠相邻歌段标题(防窗口外溢), 短段(<60s)只信检索实锤
@@ -2381,6 +2636,9 @@ def _arbitrate_titles(merged: list, lyric_ids: dict, cands_map: dict) -> list:
                 f"歌词仲裁: {pos} 《{cur_title or '未知曲目'}》翻案目标《{lt}》"
                 f"与他行强证据同名, 阻断(一场不重唱)"
             )
+            # v10 C-06: 被阻断的目标是有价值信息——塞进 cands 供一键恢复,
+            # 不让该行裸奔到"可疑标题降级"变成无信息未知
+            sg["cands"] = [{"title": lt, "score": 0.9}] + (sg.get("cands") or [])
         # 别名修正过的标题是人工级证据(位置锁定的历史纠错结论),
         # 不允许被当次歌词投票推翻——骰子 variance 不能翻盘已确证的知识
         # (1:03:54《带我走》被歌词骰子翻成《绝对占有相对自由》的实测惨案)
@@ -2512,6 +2770,86 @@ def _dedup_same_title_weak(merged: list) -> list:
             r["cands"] = [{"title": t, "score": 0}] + (r.get("cands") or [])
             r["title"] = "未知曲目"
     return merged
+
+
+def _flag_pk_rows(merged: list, transcript: list) -> list:
+    """C-08(v10): PK/连麦窗口归属标注。转写层 _PK_RE 命中的语音段(±60s 合并为窗口)
+    内的歌段打 pk 标记并把 conf 封顶 mid——乌兰巴托的夜案的教训: 识别内容是对的,
+    错的是归属(对面主播唱的); 不抑制识别, 只防止以 high 身份混进歌单。"""
+    if not transcript:
+        return merged
+    pk_ranges = sorted(
+        (t["start"], t["end"]) for t in transcript if _PK_RE.search(t.get("text", ""))
+    )
+    if not pk_ranges:
+        return merged
+    windows: list = []
+    for s, e in pk_ranges:
+        s, e = s - 60, e + 60
+        if windows and s <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], e)
+        else:
+            windows.append([s, e])
+    n = 0
+    for sg in merged:
+        if sg.get("type") != "song" or sg.get("patched"):
+            continue
+        if any(min(sg["end"], we) - max(sg["start"], ws) > 15 for ws, we in windows):
+            sg["pk"] = True
+            if sg.get("conf") in ("high", ""):
+                sg["conf"] = "mid"  # 封顶, 待审
+            n += 1
+    if n:
+        _log(f"PK窗口标注: {n} 行歌段标记 pk(疑似对面音频, conf 封顶 mid)")
+    return merged
+
+
+def _cluster_demote_fp_noise(
+    segs: list, window_s: int = 300, min_rows: int = 3
+) -> list:
+    """C-05(v10): rec=0 fp 命中是位置性噪声, 簇集出现(窗口内>=min_rows 行)说明该
+    区域是 BGM/伴奏环境而非稳定演唱。合并为一行(跨度取并集)并压 conf=low + cluster 标记。
+
+    出口保留(待审不自动删, 元规则)——洪流里藏真唱(如果可以/叹云兮案): 合并后该区域
+    仍有一行覆盖, 人工听一次可命名/拆分; 折叠=减行数不减音频覆盖。
+    """
+    drop: set = set()
+    groups: list = []
+    for sg in sorted(segs, key=lambda x: x["start"]):
+        if (
+            sg.get("type") == "song"
+            and sg.get("src") == "reco"
+            and sg.get("engine") == "fp"
+            and int(sg.get("rec_times") or 0) < 50
+            and not sg.get("patched")
+        ):
+            if groups and sg["start"] - groups[-1][-1]["end"] <= window_s:
+                groups[-1].append(sg)
+            else:
+                groups.append([sg])
+    for g in groups:
+        if len(g) < min_rows:
+            continue
+        keep = g[0]
+        keep["start"] = min(x["start"] for x in g)
+        keep["end"] = max(x["end"] for x in g)
+        keep["conf"] = "low"
+        keep["cluster"] = True
+        cands: list = list(keep.get("cands") or [])
+        for x in g[1:]:
+            for c in x.get("cands") or []:
+                if not any(cc["title"] == c["title"] for cc in cands):
+                    cands.append(c)
+            drop.add(id(x))
+        if cands:
+            keep["cands"] = cands
+        _log(
+            f"聚簇降噪: {fmt_ts(keep['start'])} 起 {len(g)} 行 fp噪声合并为一行"
+            f"(跨度 {fmt_ts(keep['end'])})"
+        )
+    if drop:
+        segs = [sg for sg in segs if id(sg) not in drop]
+    return segs
 
 
 def _conf_tier(sg: dict) -> str:
@@ -2802,34 +3140,29 @@ def _full_pipeline(job_id: str, segs: list, hits: list, wav: Path, video: Path) 
     return _recognize_llm_songs(job_id, wav, merged, video)
 
 
-def _drop_short_songs(segs: list, min_s: int = 45) -> list:
-    """过短 song 段原则上不丢弃(宁多列勿吞歌), 仅丢掉 <20s 且无任何证据的噪声段;
-    其余短段保留并由 _conf_tier 压低置信度, 交给人工待审队列决定"""
-    out = []
+def _demote_short_songs(segs: list, min_s: int | None = None) -> list:
+    """过短 song 段降级不删除(v9): <MIN_SONG_SECONDS(默认12, env可调)的段强制
+    conf=low + short 标记, 保留在数据层等人工待审/发布门槛处置; 12~45s 无证据
+    段同样标 low 保留(20s《意外》类短唱有价值)。
+
+    删除只发生在导出层(bili_intro 跳过 short 行)与人工补丁。数据层永不硬删——
+    硬删不可逆, 且其错误率受制于上游切边质量: 真歌被识别器低估成 <12s 时
+    硬删即吞歌(用户 2026-11-03 明确指出), 降级则始终可恢复。
+    """
+    min_s = min_s or _env_int("MIN_SONG_SECONDS", 12)
     for sg in segs:
-        if sg["type"] == "song" and sg["end"] - sg["start"] < min_s:
-            at_edge = sg["start"] < 90
-            # 弱命中(假投票)不构成豁免证据: 《时光》类 13s 幻听段由此被拦
-            has_evidence = (
-                sg.get("src") == "reco"
-                and _sane_title(sg["title"])
-                and not sg.get("weak")
-            )
-            if at_edge or has_evidence:
-                out.append(sg)
-                continue
-            if sg["end"] - sg["start"] < 20:
-                _log(
-                    f"丢弃过短song段({sg['end'] - sg['start']:.0f}s): 《{sg['title']}》"
-                )
-                continue
-            # 20-45s 无证据短段(清唱片段/点歌哼两句): 保留但强制待审
+        if sg["type"] != "song":
+            continue
+        dur = sg["end"] - sg["start"]
+        if dur < min_s:
             sg["conf"] = "low"
-            _log(
-                f"保留无证据短song段({sg['end'] - sg['start']:.0f}s)并标存疑: 《{sg['title']}》"
-            )
-        out.append(sg)
-    return out
+            sg["short"] = True
+        elif dur < 45 and not (
+            sg.get("src") == "reco" and _sane_title(sg["title"]) and not sg.get("weak")
+        ):
+            # 12-45s 无证据短段保留但强制待审(宁多列勿吞)
+            sg["conf"] = "low"
+    return segs
 
 
 def _run_analysis(job_id: str, video: Path, mode: str = "full") -> None:
@@ -2929,7 +3262,9 @@ def _run_analysis(job_id: str, video: Path, mode: str = "full") -> None:
         merged = _split_giant_song_segments(merged, _music_segs, _all_hits)
         merged = _apply_recog_alias(merged)  # 顽固性误配的别名表, 在仲裁前修正标题
         _set_job(job_id, pct=95, msg="歌词辅助识别中…")
-        _lyric_out, _cands_map = _identify_songs_by_lyrics(job_id, merged, segs)
+        (_lyric_out, _cands_map, _lyric_n, _skipped_sure) = _identify_songs_by_lyrics(
+            job_id, merged, segs
+        )
         merged = _arbitrate_titles(merged, _lyric_out, _cands_map)
         # 版本标注括号代码侧确定性清除(全模式生效, 不再依赖LLM记得删)
         for _sg in merged:
@@ -2940,8 +3275,8 @@ def _run_analysis(job_id: str, video: Path, mode: str = "full") -> None:
                     _sg["title"] = _ct
         # 末尾再桥接合并一次: 二轮/补漏识别后追加的同歌碎片(中间夹短闲聊段)并回,
         # 例如补漏命中的两个《晴》夹着一个10s闲聊——早期那次桥接管不到晚到的段
-        merged = _bridge_split_songs(_drop_short_songs(_merge_adjacent_songs(merged)))
-        merged = _drop_short_songs(_merge_adjacent_songs(merged))
+        merged = _bridge_split_songs(_demote_short_songs(_merge_adjacent_songs(merged)))
+        merged = _demote_short_songs(_merge_adjacent_songs(merged))
         # 开始时间戳对齐音频级音乐段(提前+口播区推后), 先吸收对齐撞车的
         # 双检测未知行, 再整形重叠边界
         merged = _align_song_starts_to_music(merged, _music_segs)
@@ -2949,6 +3284,14 @@ def _run_analysis(job_id: str, video: Path, mode: str = "full") -> None:
         merged = _resolve_overlaps(merged)
         # 人工补丁重放(最高优先级证据), 补丁改同名后可能有新可合并碎片, 再收尾一次
         merged = _apply_manual_patches(merged, video)
+        merged = _resolve_overlaps(_merge_adjacent_songs(merged))
+        # v9: 精确重复副本折叠(同起同终才折, ABB 真两首保留)
+        merged = _collapse_fragment_rows(merged)
+        # v10: PK窗口归属标注 + fp噪声聚簇(补丁之后, 人工结论不被覆盖)
+        merged = _flag_pk_rows(merged, segs)
+        merged = _cluster_demote_fp_noise(merged)
+        # v10.2 C-13: 聚簇并集跨度可能盖住区间内真实歌段, 补重叠整形——
+        # 噪声大行被真实歌段切断, 不再产生覆盖式重叠(唯一重叠困惑案)
         merged = _resolve_overlaps(_merge_adjacent_songs(merged))
         # 同名去重放在合并之后: 同歌碎片先并回, 剩下的跨时段重名才按幻影降级
         merged = _dedup_same_title_weak(merged)
@@ -2977,6 +3320,27 @@ def _run_analysis(job_id: str, video: Path, mode: str = "full") -> None:
                 for sg in merged
             ]
             overall = _llm_overall_summary(json.dumps(compact, ensure_ascii=False))
+        # 段内音乐断点数(v45): >=2 疑似跨歌, 前端标徽标提示人工听段尾——
+        # 吞歌的失败点不产生任何时间轴行, 必须给人留审核入口
+        for _sg in merged:
+            if _sg.get("type") == "song":
+                _sg["music_breaks"] = sum(
+                    1
+                    for _m in _music_segs
+                    if _sg["start"] + 15 < float(_m["start"]) < _sg["end"] - 15
+                )
+                # v10: 歌词双信号视同跨歌, 触发同款徽标
+                if _sg.get("multi_signal") and _sg["music_breaks"] < 2:
+                    _sg["music_breaks"] = 2
+        # v10: 命名归因统计(每场日志自动回答"LLM 贡献多大")
+        _songs_all = [s for s in merged if s.get("type") == "song"]
+        _src_n = lambda k: sum(1 for s in _songs_all if s.get("src") == k)
+        _log(
+            f"命名归因: reco={_src_n('reco')} llm={_src_n('llm')} "
+            f"manual={_src_n('manual')} patched={sum(1 for s in _songs_all if s.get('patched'))} "
+            f"未知={sum(1 for s in _songs_all if (s.get('title') or '').strip() in ('', '未知曲目'))} "
+            f"| 歌词判定覆盖 {_lyric_n} 段(跳过高置信 {_skipped_sure})"
+        )
         result = {
             "version": 1,
             "mode": mode,
@@ -3007,11 +3371,55 @@ def _run_analysis(job_id: str, video: Path, mode: str = "full") -> None:
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         _log(f"分析完成: {len(merged)} 段, 已保存 {out.name}")
+        _journal(
+            "generated",
+            video=video.name,
+            key=_cache_key(video),
+            mode=mode,
+            stats=_seg_stats(merged),
+            auto_segments=merged,
+        )
         _set_job(job_id, status="done", pct=100, msg="完成", result=result)
     except AnalysisError as e:
         _set_job(job_id, status="failed", msg=str(e))
     except Exception as e:
         _set_job(job_id, status="failed", msg=f"未知错误: {e}")
+
+
+_JOURNAL_PATH = Path("logs") / "review_journal.jsonl"
+
+
+def _journal(event: str, **kw) -> None:
+    """审核/生成流水(JSONL 追加, 只增不改): 每次自动生成与每次人工对齐各记一条。
+
+    这是项目的测试集档案——auto_segments 是系统产出, final_segments 是人工
+    对齐真值, patches/alias_learned 是学习到的调整方案, 可供离线评估、
+    统计错误率分布、回放任意一场的自动产出。
+    """
+    try:
+        rec = {"ts": datetime.now().isoformat(timespec="seconds"), "event": event, **kw}
+        _JOURNAL_PATH.parent.mkdir(exist_ok=True)
+        with open(_JOURNAL_PATH, "a", encoding="utf-8") as _fp:
+            _fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as _e:
+        _log(f"审核流水写入失败({_e}), 忽略")
+
+
+def _seg_stats(segs: list) -> dict:
+    """歌单质量统计: 发布门槛/错误率趋势的数据源"""
+    songs = [s for s in segs if s.get("type") == "song"]
+
+    def _cnt(conf: str) -> int:
+        return sum(1 for s in songs if s.get("conf") == conf)
+
+    return {
+        "n_segments": len(segs),
+        "n_songs": len(songs),
+        "n_unknown": sum(
+            1 for s in songs if (s.get("title") or "").strip() in ("", "未知曲目")
+        ),
+        "conf": {"high": _cnt("high"), "mid": _cnt("mid"), "low": _cnt("low")},
+    }
 
 
 def get_analysis(video: Path) -> dict | None:
@@ -3033,7 +3441,9 @@ def save_analysis(video: Path, segments: list, overall: str | None = None) -> di
         if norm:
             segs.append(norm)
     segs.sort(key=lambda x: (x["start"], x["end"]))
-    _learn_alias_from_edits(old, segs)  # 人工纠正识别错名 → 自动学进别名表
+    _alias_learned = (
+        _learn_alias_from_edits(old, segs) or {}
+    )  # 人工纠正识别错名 → 自动学进别名表
     _learn_patches_from_edits(old, segs, video)  # 人工修正补丁层: 重跑自动重放
     result = {
         "version": 1,
@@ -3048,4 +3458,16 @@ def save_analysis(video: Path, segments: list, overall: str | None = None) -> di
     p = _json_path(video)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 审核流水(v46): 系统产出 + 人工真值 + 调整方案, 一条配对记录
+    _journal(
+        "reviewed",
+        video=video.name,
+        key=_cache_key(video),
+        stats_old=_seg_stats(old.get("segments") or []),
+        stats_new=_seg_stats(segs),
+        auto_segments=old.get("segments") or [],
+        final_segments=segs,
+        patches=_load_patches(video),
+        alias_learned=_alias_learned,
+    )
     return result
