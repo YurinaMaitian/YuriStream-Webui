@@ -83,10 +83,31 @@ def set_pref(record_url: str, enabled: bool) -> None:
 
 # ---------------- 工具 ----------------
 
+_room_id_cache: dict = {}
+
 
 def room_id_from_url(record_url: str) -> str | None:
+    """数字 room_id 提取。直接链接用正则; 短链/用户主页链接复用录制侧解析链换算
+    (get_douyin_app_stream_data 内部已覆盖 v.douyin.com 短链与 /user/ 主页两种形态)。
+    仅开播时可换算——未开播时主页下不存在直播间, 无从连接(此时也无录制在跑)。"""
     m = re.search(r"live\.douyin\.com/(\d+)", record_url)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    key = record_url.split("?")[0]
+    if key in _room_id_cache:
+        return _room_id_cache[key]
+    try:
+        import asyncio
+        from src import spider
+
+        data = asyncio.run(spider.get_douyin_app_stream_data(url=record_url))
+        rid = str(data.get("id_str") or data.get("id") or "")
+        if rid and rid != "None":
+            _room_id_cache[key] = rid
+            return rid
+    except Exception as e:
+        print(f"[danmaku] 房间号换算失败({record_url}): {e}")
+    return None
 
 
 def _base_path(save_file_path: str) -> str:
