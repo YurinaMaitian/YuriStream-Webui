@@ -173,3 +173,8 @@ play_cache/
 *.wav
 
 web-ui/.vscode/
+
+
+danmu/douyinLive.exe
+danmu/douyinLive
+danmu/config.yaml

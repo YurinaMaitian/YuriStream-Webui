@@ -12,10 +12,13 @@
     </header>
 
     <div class="player-wrap">
-      <div class="player-box">
+      <div class="player-box" ref="playerBox">
         <div class="player-video">
-          <video ref="videoEl" controls autoplay
+          <video ref="videoEl" controls autoplay controlslist="nofullscreen"
                  :src="playPath ? `${API_BASE}/api/play?path=${encodeURIComponent(playPath)}` : undefined"></video>
+          <canvas v-show="dmOn" ref="dmCanvas" class="dm-canvas" :style="dmLayerStyle"></canvas>
+          <span v-if="isFs" class="fs-title">{{ playTitle }}</span>
+          <div class="click-layer" @click="onVideoClick" @dblclick="toggleFs"></div>
           <span v-if="playTitle" class="player-title">{{ playTitle }}</span>
           <span v-else class="player-hint">从右侧录像树点播，或点"观看直播"</span>
           <span v-if="liveUrl" class="live-badge"><i></i>LIVE</span>
@@ -25,7 +28,37 @@
           <span>
             <el-button v-if="playPath" size="small" type="primary" plain :icon="MagicStick" class="sum-btn" @click="openAnalysis(playPath)">视频总结</el-button>
             <el-button size="small" class="wide-btn" @click="wide = !wide">{{ wide ? '退出宽屏' : '宽屏' }}</el-button>
-            <el-button size="small" text :disabled="!playPath && !liveUrl" @click="closePlayer">关闭</el-button>
+<el-button size="small" class="fs-btn" @click="toggleFs">{{ isFs ? '退出全屏' : '全屏' }}</el-button>
+            <el-button size="small" :type="dmOn ? 'primary' : 'default'" plain @click="dmOn = !dmOn">{{ dmOn ? '弹幕 开' : '弹幕 关' }}</el-button>
+<el-dropdown v-if="dmOn" size="small" trigger="click" @command="v => dmZone = v">
+              <el-button size="small" plain>区域 {{ zoneLabel }}</el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="full">全屏</el-dropdown-item>
+                  <el-dropdown-item command="top">上半屏</el-dropdown-item>
+                  <el-dropdown-item command="third">上 1/3</el-dropdown-item>
+                  <el-dropdown-item command="bottom">底部 1/3</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+<el-popover v-if="dmOn" placement="top" :width="250" trigger="click">
+  <template #reference><el-button size="small" plain>弹幕设置</el-button></template>
+  <div class="dm-set">
+    <div class="dm-set-row"><span class="dm-set-label">字号</span><el-slider v-model="dmSize" :min="12" :max="28" :show-tooltip="false" /></div>
+    <div class="dm-set-row"><span class="dm-set-label">速度</span><el-slider v-model="dmSpeedMul" :min="0.5" :max="2" :step="0.1" :show-tooltip="false" /></div>
+    <div class="dm-set-row"><span class="dm-set-label">间距</span><el-slider v-model="dmSpacing" :min="4" :max="40" :show-tooltip="false" /></div>
+    <div class="dm-set-row"><span class="dm-set-label">颜色</span>
+      <el-radio-group v-model="dmColorMode" size="small">
+        <el-radio-button value="white">白</el-radio-button>
+        <el-radio-button value="colorful">彩</el-radio-button>
+        <el-radio-button value="yellow">黄</el-radio-button>
+        <el-radio-button value="red">红</el-radio-button>
+        <el-radio-button value="blue">蓝</el-radio-button>
+      </el-radio-group>
+    </div>
+  </div>
+</el-popover>
+<el-button size="small" text :disabled="!playPath && !liveUrl" @click="closePlayer">关闭</el-button>
           </span>
         </div>
       </div>
@@ -102,6 +135,7 @@
           </div>
           <el-tag v-if="isRecording(u)" type="danger" size="small" effect="light">录制中</el-tag>
           <el-button size="small" text type="primary" @click="rebroadcast(u.url)">转播</el-button>
+          <el-switch :model-value="u.danmaku" size="small" inline-prompt active-text="弹幕" inactive-text="弹幕" @change="v => toggleDanmaku(u, v)" />
           <el-button size="small" text @click="disable(u.url)">停用</el-button>
           <el-button size="small" text type="danger" @click="removeAnchor(u.url)">删除</el-button>
         </div>
@@ -113,6 +147,7 @@
           </div>
           <el-tag size="small" type="info" effect="light">已停用</el-tag>
           <el-button size="small" text type="primary" @click="rebroadcast(u.url)">转播</el-button>
+          <el-switch :model-value="u.danmaku" size="small" inline-prompt active-text="弹幕" inactive-text="弹幕" @change="v => toggleDanmaku(u, v)" />
           <el-button size="small" text type="success" @click="enable(u.url)">启用</el-button>
           <el-button size="small" text type="danger" @click="removeAnchor(u.url)">删除</el-button>
         </div>
@@ -312,6 +347,30 @@ const playPath = ref('')
 const liveUrl = ref('')
 const liveName = ref('')
 const videoEl = ref(null)
+const playerBox = ref(null)
+const isFs = ref(false)
+function onVideoClick() {
+  const v = videoEl.value
+  if (!v) return
+  if (v.paused) v.play().catch(() => {})
+  else v.pause()
+}
+function toggleFs() {
+  if (!document.fullscreenElement) playerBox.value?.requestFullscreen?.()
+  else document.exitFullscreen()
+}
+let fsHideTimer = null
+function fsUiWake() {
+  if (!isFs.value || !playerBox.value) return
+  playerBox.value.classList.add('show-ui')
+  clearTimeout(fsHideTimer)
+  fsHideTimer = setTimeout(() => playerBox.value?.classList.remove('show-ui'), 3000)
+}
+function onFsChange() {
+  isFs.value = !!document.fullscreenElement
+  if (isFs.value) fsUiWake()
+  else playerBox.value?.classList.remove('show-ui')
+}
 const treeRef = ref(null)
 const parsing = ref(false)
 const preview = ref(null)
@@ -386,8 +445,11 @@ function prettyName(n) {
   return (n || '').replace(/^序号\d+\s*/, '')
 }
 
-watch(playPath, p => {
+watch(playPath, async p => {
   if (p && hls) { hls.destroy(); hls = null; liveUrl.value = '' }
+  dmDisconnectLive()
+  dmClear()
+  if (p && dmOn.value) await dmLoadPlayback(p)
 })
 
 watch(liveUrl, async url => {
@@ -413,11 +475,14 @@ watch(liveUrl, async url => {
   } else {
     videoEl.value.src = url
   }
+  syncLiveDanmaku()
 })
 
 function play(p) { playPath.value = p }
 
 function closePlayer() {
+  dmDisconnectLive()
+  dmClear()
   playPath.value = ''
   liveUrl.value = ''
   liveName.value = ''
@@ -430,6 +495,7 @@ async function watchLive(name) {
   if (!res.ok) { ElMessage.error(`失败：${data.error}`); return }
   liveUrl.value = data.hls
   liveName.value = '直播 · ' + prettyName(name)
+  dmLiveRecordName = name
 }
 
 // ---------- 监控管理 ----------
@@ -505,6 +571,7 @@ async function rebroadcast(url) {
   if (!res.ok) { ElMessage.error(data.error || '转播失败'); return }
   liveUrl.value = data.hls
   liveName.value = '直播 · ' + (data.name || '转播')
+  dmLiveRecordName = ''  // 转播无录制会话, 无弹幕
   manageVisible.value = false
 }
 
@@ -682,7 +749,16 @@ async function doMerge() {
         } catch (e) { /* 下轮重试 */ }
       }, 1500)
     })
-    ElMessage.success(`已合并：${done.path}`)
+    if (done.danmaku?.gaps?.length) {
+      const lines = done.danmaku.gaps.map(g => `${g.after} → ${g.before}：缺口 ${g.seconds}s`)
+      ElMessageBox.alert(
+        `画面缺失区间已检测并跳过（弹幕衔接对齐）：\n\n${lines.join('\n')}\n\n缺口区间丢弃弹幕 ${done.danmaku.dropped_in_gap ?? 0} 条（源档案未删）`,
+        '合并完成 · 有断连缺口',
+        { type: 'warning' },
+      )
+    } else {
+      ElMessage.success(`已合并：${done.path}`)
+    }
     mergeList.value = []
     mergeVisible.value = false
     refresh()
@@ -911,6 +987,258 @@ function playSegAt(seg, where) {
   nextTick(() => { if (videoEl.value) videoEl.value.currentTime = t })
 }
 
+// ---------- 弹幕: Canvas 引擎(B站/DPlayer 同款方案) / 区域 / 设置 / 直播 SSE ----------
+// 核心: 单 canvas 每帧清屏重绘, 零 DOM 布局/重绘, 流畅度由绘制管线保证
+const dmOn = ref(localStorage.getItem('ys-danmaku') !== '0')
+const dmZone = ref(localStorage.getItem('ys-dm-zone') || 'full')
+const dmSize = ref(parseInt(localStorage.getItem('ys-dm-size') || '16'))
+const dmSpeedMul = ref(parseFloat(localStorage.getItem('ys-dm-speed') || '1'))
+const dmColorMode = ref(localStorage.getItem('ys-dm-color') || 'white')
+const dmSpacing = ref(parseInt(localStorage.getItem('ys-dm-spacing') || '14'))
+const dmCanvas = ref(null)
+let dmQueue = []            // 回放: 待投放事件(文件本地 ts 排序)
+let dmActive = []           // {text, lane, speed, width, x, color, alpha, size}
+let dmSource = null         // EventSource(直播模式)
+let dmLiveRecordName = ''   // 直播 SSE 用的 record_name(仅"正在录制"入口有会话)
+let dmLiveHold = []         // 直播暂停时暂存(恢复后补投)
+let dmTimer = null          // 投放调度器(200ms 轮询)
+let dmRaf = null            // 绘制循环
+let dmLastDrawTs = 0
+const laneState = new Array(24).fill(null)
+const dmRecentTexts = new Map()
+const DM_MAX_SPAWN_PER_SEC = 8
+let dmBudget = 0
+let dmBudgetTs = 0
+
+const zoneLabel = computed(() => ({ full: '全屏', top: '上半', third: '上⅓', bottom: '底⅓' }[dmZone.value] || '全屏'))
+const dmLayerStyle = computed(() => ({
+  full: { top: '0', height: '100%' },
+  top: { top: '0', height: '50%' },
+  third: { top: '0', height: '33%' },
+  bottom: { top: '64%', height: '36%' },
+}[dmZone.value]))
+const DM_FONT = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif'
+
+// 抖音表情码 → emoji(未命中保留原码; 表可自由扩充)
+const DM_EMOJI = {
+  '捂脸': '🤦', '流泪': '😭', '笑哭': '😂', '大笑': '😄', '呲牙': '😁', '嘻嘻': '😁',
+  '送心': '❤️', '比心': '❤️', '爱心': '❤️', '心碎': '💔', '赞': '👍', '顶呱呱': '👍',
+  '强': '💪', '加油': '💪', '加油加油': '💪', '鼓掌': '👏', '感谢': '🙏', '保佑': '🙏',
+  '看': '👀', '思考': '🤔', '机智': '😏', '吃瓜群众': '🍉', '玫瑰': '🌹', '害羞': '😊',
+  '可爱': '😊', '呆无辜': '🥺', '可怜': '🥺', '委屈': '😢', '哭泣': '😭', '吐血': '🤢',
+  '发怒': '😡', '哼': '😤', '震惊': '😱', '晕': '😵‍💫', '宕机': '😵', '疑问': '❓',
+  '彩虹屁': '🌈', '击掌': '🙌', '炸弹': '💣', '抠鼻': '🤏', '舔屏': '😋', '暖心': '🥰',
+  '抱抱': '🤗', '哈欠': '🥱', '睡着': '💤', '钱袋': '💰', '灵机一动': '💡', '翻白眼': '🙄',
+  '火火': '🔥', '庆祝': '🎉', '礼花': '🎉', '烟花': '🎆', '啤酒': '🍺', '奶茶': '🧋',
+  '蛋糕': '🎂', '礼物': '🎁', '红包': '🧧', '来了来了': '🏃', '不失礼貌的微笑': '🙂',
+  '握手': '🤝', 'OK': '👌',
+}
+const DM_PALETTE = ['#ffffff', '#ffd93d', '#ff6b6b', '#6bcb77', '#7cc7ff', '#f473b9', '#c084fc']
+const DM_COLORS = { white: '#ffffff', yellow: '#ffd93d', red: '#ff6b6b', blue: '#7cc7ff' }
+
+function dmFormatText(text) {
+  return String(text).replace(/\[([^\[\]{}\s]{1,10})\]/g, (m, k) => DM_EMOJI[k] || m)
+}
+
+watch(dmZone, v => localStorage.setItem('ys-dm-zone', v))
+watch(dmSize, v => localStorage.setItem('ys-dm-size', String(v)))
+watch(dmSpeedMul, v => localStorage.setItem('ys-dm-speed', String(v)))
+watch(dmColorMode, v => localStorage.setItem('ys-dm-color', v))
+watch(dmSpacing, v => localStorage.setItem('ys-dm-spacing', String(v)))
+watch(dmOn, v => {
+  localStorage.setItem('ys-danmaku', v ? '1' : '0')
+  if (!v) { dmStop(); dmClear(); dmDisconnectLive() }
+  else if (playPath.value) dmLoadPlayback(playPath.value)
+  else if (liveUrl.value) syncLiveDanmaku()
+})
+
+async function toggleDanmaku(u, val) {
+  const res = await fetch('/api/danmaku/toggle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: u.url, enabled: val }),
+  })
+  if (!res.ok) { ElMessage.error('弹幕开关设置失败'); return }
+  u.danmaku = val
+  ElMessage.success(val ? `已开启「${u.name || u.url}」弹幕转存` : `已关闭「${u.name || u.url}」弹幕转存（进行中的会话下一场生效）`)
+}
+
+async function dmLoadPlayback(p) {
+  dmQueue = []
+  try {
+    const res = await fetch(`/api/danmaku?path=${encodeURIComponent(p)}`)
+    const data = await res.json()
+    if (data.count > 0) {
+      dmQueue = (data.events || []).slice().sort((x, y) => x.ts - y.ts)
+      dmStart()
+    }
+  } catch { /* 无弹幕档案则忽略 */ }
+}
+
+function syncLiveDanmaku() {
+  dmDisconnectLive()
+  dmClear()
+  if (!dmOn.value || !liveUrl.value || !dmLiveRecordName) return
+  dmSource = new EventSource(`/api/danmaku/live?record_name=${encodeURIComponent(dmLiveRecordName)}`)
+  dmSource.addEventListener('danmaku', e => {
+    try {
+      const ev = JSON.parse(e.data)
+      if (videoEl.value && videoEl.value.paused) {
+        if (dmLiveHold.length < 40) dmLiveHold.push(ev)
+      } else dmSpawn(ev.text, ev.user)
+    } catch { /* 结束帧忽略 */ }
+  })
+  dmSource.addEventListener('end', () => dmDisconnectLive())
+  dmStart()
+}
+
+function dmDisconnectLive() {
+  if (dmSource) { dmSource.close(); dmSource = null }
+}
+
+// 生成一条弹幕对象(不入屏): 测宽/选轨/限速/去重都在这里
+function dmSpawn(text, user) {
+  const cvs = dmCanvas.value
+  if (!cvs || !text) return false
+  const now = performance.now()
+  if (now - dmBudgetTs > 1000) { dmBudgetTs = now; dmBudget = 0 }
+  if (dmBudget >= DM_MAX_SPAWN_PER_SEC) return false
+  if (dmActive.length >= 30) return false  // 同屏上限
+  text = dmFormatText(text)
+  // 复读限流: 45s 内同内容丢弃(该生态是几十用户复制粘贴同一句, 必须纯文本去重)
+  const lastSeen = dmRecentTexts.get(text)
+  if (lastSeen && now - lastSeen < 45000) return false
+  if (dmRecentTexts.size > 600) dmRecentTexts.clear()
+  dmRecentTexts.set(text, now)
+
+  const W = cvs.clientWidth || 640
+  const H = cvs.clientHeight || 360
+  const size = dmSize.value
+  const laneH = size + dmSpacing.value
+  const ctx = cvs.getContext('2d')
+  const full = user ? `${user}：${text}` : text
+  ctx.font = `500 ${size}px ${DM_FONT}`
+  const width = ctx.measureText(full).width
+  // 速度: 下限 120px/s 且任何弹幕 9s 内穿出屏幕(防长弹幕爬墙成文字墙)
+  let speed = Math.max(120, 220 - full.length * 3) * dmSpeedMul.value * (0.9 + Math.random() * 0.25)
+  speed = Math.max(speed, (W + width + 30) / 9)
+  // 防追尾选轨: 队首尾巴过 45% 屏 + 间隔 500ms + 新速不高于前速
+  const lanes = Math.min(24, Math.max(4, Math.floor(H / laneH)))
+  let lane = -1
+  for (let i = 0; i < lanes; i++) {
+    const st = laneState[i]
+    if (!st) { lane = i; break }
+    const tailNow = st.x0 + st.width - st.speed * (now - st.spawnTs) / 1000
+    if (tailNow < W * 0.45 && now - st.spawnTs > 500 && speed <= st.speed * 1.05) { lane = i; break }
+  }
+  if (lane < 0) return false
+  const color = dmColorMode.value === 'colorful'
+    ? DM_PALETTE[Math.floor(Math.random() * DM_PALETTE.length)]
+    : (DM_COLORS[dmColorMode.value] || '#ffffff')
+  const item = {
+    text: full, lane, speed, width, size,
+    x0: W, x: W,
+    spawnTs: now,
+    color, alpha: 0.7 + Math.random() * 0.3,
+  }
+  laneState[lane] = item
+  dmActive.push(item)
+  dmBudget += 1
+  if (!dmRaf) dmArmDraw()
+  return true
+}
+
+// 绘制循环: 每帧清屏 + 按真实时间推进 + 描边文本(单管线, GPU 友好)
+function dmDraw(tsNow) {
+  dmRaf = null
+  const cvs = dmCanvas.value
+  if (!cvs) return
+  const ctx = cvs.getContext('2d')
+  const dpr = window.devicePixelRatio || 1
+  const W = cvs.clientWidth || 640
+  const H = cvs.clientHeight || 360
+  if (cvs.width !== Math.round(W * dpr) || cvs.height !== Math.round(H * dpr)) {
+    cvs.width = Math.round(W * dpr)
+    cvs.height = Math.round(H * dpr)
+  }
+  // 视频暂停 → 冻结最后一帧不清屏(B站行为), play 事件会重新启动绘制
+  if (videoEl.value && videoEl.value.paused && liveUrl.value === '') return
+  const dt = Math.min(0.1, Math.max(0.001, (tsNow - dmLastDrawTs) / 1000))
+  dmLastDrawTs = tsNow
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, W, H)
+  const laneHBase = dmSize.value + dmSpacing.value
+  for (let i = dmActive.length - 1; i >= 0; i--) {
+    const d = dmActive[i]
+    d.x -= d.speed * dt
+    if (d.x < -d.width - 30) {
+      if (laneState[d.lane] === d) laneState[d.lane] = null
+      dmActive.splice(i, 1)
+      continue
+    }
+    ctx.font = `500 ${d.size}px ${DM_FONT}`
+    ctx.globalAlpha = d.alpha
+    ctx.lineWidth = Math.max(2, d.size / 8)
+    ctx.lineJoin = 'round'
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)'
+    ctx.strokeText(d.text, d.x, d.lane * laneHBase + d.size)
+    ctx.fillStyle = d.color
+    ctx.fillText(d.text, d.x, d.lane * laneHBase + d.size)
+  }
+  ctx.globalAlpha = 1
+  dmRaf = requestAnimationFrame(dmDraw)
+}
+
+function dmArmDraw() {
+  if (dmRaf || !dmOn.value) return
+  dmLastDrawTs = performance.now()
+  dmRaf = requestAnimationFrame(dmDraw)
+}
+
+// 投放调度: 200ms 轮询到点事件(轻量; 绘制独立于此)
+function dmScheduler() {
+  try {
+    if (!dmOn.value || !videoEl.value) return
+    if (videoEl.value.paused) return  // 冻结: 不投放不补投
+    const t = videoEl.value.currentTime
+    while (liveUrl.value === '' && dmQueue.length && dmQueue[0].ts <= t + 0.15) {
+      const ev = dmQueue.shift()
+      if (ev.ts >= t - 2.0) dmSpawn(ev.text, ev.user)
+    }
+    while (dmLiveHold.length) {
+      if (!dmSpawn(dmLiveHold[0].text, dmLiveHold[0].user)) break
+      dmLiveHold.shift()
+    }
+  } catch (e) { /* 调度器异常不扩散 */ }
+}
+
+function dmSyncPause() {
+  if (!videoEl.value) return
+  if (videoEl.value.paused) {
+    // 冻结: 停掉绘制循环, canvas 保留最后一帧不清屏
+    if (dmRaf) { cancelAnimationFrame(dmRaf); dmRaf = null }
+  } else {
+    dmArmDraw()  // 恢复播放 → 绘制循环接着走
+  }
+}
+
+function dmStart() { if (!dmTimer && dmOn.value) dmTimer = setInterval(dmScheduler, 200) }
+function dmStop() { if (dmTimer) { clearInterval(dmTimer); dmTimer = null } }
+
+function dmClear() {
+  dmQueue = []
+  dmLiveHold = []
+  dmActive = []
+  laneState.fill(null)
+  dmRecentTexts.clear()
+  if (dmRaf) { cancelAnimationFrame(dmRaf); dmRaf = null }
+  const cvs = dmCanvas.value
+  if (cvs) {
+    const ctx = cvs.getContext('2d')
+    ctx && ctx.clearRect(0, 0, cvs.width, cvs.height)
+  }
+}
+
 // ---------- 投稿简介导出 (B站转载格式, 复制即用) ----------
 const introVisible = ref(false)
 const introText = ref('')
@@ -966,7 +1294,7 @@ function fmtDuration(s) {
 function onSpaceToggle(e) {
   // 全局空格暂停/播放: 输入框/文本域内不劫持(打字时空格照常),
   // 其余页面任意位置(含按钮聚焦时)空格都作用于视频
-  if (e.code !== 'Space') return
+  if (e.code !== 'Space' || e.repeat) return
   const t = e.target
   const tag = (t && t.tagName) || ''
   if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return
@@ -978,15 +1306,35 @@ function onSpaceToggle(e) {
 
 onMounted(() => {
   refresh()
+  nextTick(() => {
+    if (videoEl.value) {
+      videoEl.value.addEventListener('pause', dmSyncPause)
+      videoEl.value.addEventListener('play', dmSyncPause)
+    }
+  })
   timer = setInterval(() => { nowTs.value = Date.now(); refresh() }, 5000)
   window.addEventListener('resize', onResize)
   window.addEventListener('keydown', onSpaceToggle)
+  document.addEventListener('fullscreenchange', onFsChange)
+  playerBox.value?.addEventListener('mousemove', fsUiWake)
+  playerBox.value?.addEventListener('touchstart', fsUiWake)
 })
 
 onUnmounted(() => {
   clearInterval(timer)
+  if (videoEl.value) {
+    videoEl.value.removeEventListener('pause', dmSyncPause)
+    videoEl.value.removeEventListener('play', dmSyncPause)
+  }
+  dmStop()
+  dmClear()
+  dmDisconnectLive()
   window.removeEventListener('resize', onResize)
   window.removeEventListener('keydown', onSpaceToggle)
+  document.removeEventListener('fullscreenchange', onFsChange)
+  playerBox.value?.removeEventListener('mousemove', fsUiWake)
+  playerBox.value?.removeEventListener('touchstart', fsUiWake)
+  clearTimeout(fsHideTimer)
   if (hls) hls.destroy()
 })
 </script>
@@ -1030,6 +1378,28 @@ body { background: #f4f5f7; margin: 0;
 .live-badge i { width: 7px; height: 7px; border-radius: 50%; background: #ff4d4f; animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { opacity: .35; } }
 .player-bar { display: flex; justify-content: space-between; align-items: center; gap: 8px; background: #fff; padding: 7px 12px; }
+.player-box:fullscreen { display: flex; flex-direction: column; justify-content: center; background: #000; border-radius: 0; }
+/* 全屏影院态: 鼠标静止时全隐藏, 移动时浮出(B站行为) */
+.player-box:fullscreen { cursor: none; }
+.player-box:fullscreen.show-ui { cursor: default; }
+.player-box:fullscreen .player-bar {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 20;
+  background: linear-gradient(transparent, rgba(10,10,14,.92) 40%);
+  transform: translateY(102%); opacity: 0;
+  transition: transform .28s ease, opacity .28s ease;
+}
+.player-box:fullscreen.show-ui .player-bar { transform: translateY(0); opacity: 1; }
+.fs-title {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 20;
+  padding: 14px 18px 32px; pointer-events: none;
+  background: linear-gradient(rgba(0,0,0,.68), transparent);
+  color: #fff; font-size: 15px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  opacity: 0; transition: opacity .28s ease;
+}
+.player-box:fullscreen.show-ui .fs-title { opacity: 1; }
+.player-box:fullscreen .player-video { width: 100%; height: 100%; }
+.player-box:fullscreen .player-video video { width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }
 .player-bar > span:last-child { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .pb-title { font-size: 12px; color: #606266; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 75%; }
 
@@ -1145,4 +1515,11 @@ body { background: #f4f5f7; margin: 0;
   .ana-seg { flex-wrap: wrap; }
   .ana-path { max-width: 180px; }
 }
+
+.dm-canvas { position: absolute; left: 0; right: 0; width: 100%; pointer-events: none; z-index: 5; }
+/* 透明点击层: 点击画面切换播放/暂停; 底部 70px 保留给原生控制条, 避免双触发 */
+.click-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 70px; z-index: 4; }
+.dm-set-row { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.dm-set-label { flex: none; width: 32px; font-size: 12px; color: #606266; }
+.dm-set-row :deep(.el-slider) { flex: 1; }
 </style>

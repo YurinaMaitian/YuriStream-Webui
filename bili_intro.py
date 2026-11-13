@@ -32,6 +32,7 @@ DEFAULT_PROFILE: dict = {
     "title_pattern": "【{anchor}】{date} 直播回放",
     "declaration": "本视频为录播转载，不含商业推广，如有侵权问题请联系删减或下架",
     "include_unknown_songs": True,  # 未知曲目也列出 (观众评论区补歌名)
+    "min_song_seconds": 12,  # 短于该时长的歌不进投稿歌单(v9: 数据层降级不删, 导出层过滤)
     "include_low_conf": True,
     "room_url": "",  # 原直播间地址 (建议: 填这个, 简介主链接)
     "home_url": "",  # 主播主页 (可选: room_url 为空时自动解析出直播间)
@@ -184,6 +185,8 @@ def build_intro(
         s
         for s in segments
         if s.get("type") == "song"
+        and int(s.get("end", 0)) - int(s.get("start", 0))
+        >= int(profile.get("min_song_seconds", 12))  # v9: 短片段不进歌单
         and (profile["include_low_conf"] or s.get("conf") == "high")
         and (
             profile["include_unknown_songs"]

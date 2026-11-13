@@ -1,0 +1,3 @@
+[submodule "danmu"]
+	path = danmu
+	url = https://github.com/jwwsjlm/douyinLive.git
