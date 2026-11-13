@@ -87,9 +87,12 @@ _room_id_cache: dict = {}
 
 
 def room_id_from_url(record_url: str) -> str | None:
-    """数字 room_id 提取。直接链接用正则; 短链/用户主页链接复用录制侧解析链换算
-    (get_douyin_app_stream_data 内部已覆盖 v.douyin.com 短链与 /user/ 主页两种形态)。
-    仅开播时可换算——未开播时主页下不存在直播间, 无从连接(此时也无录制在跑)。"""
+    """数字 room_id(web_rid) 提取。
+    - live.douyin.com/{id} 直接正则;
+    - 用户主页/短链: 换算出 web_rid 后再喂给 douyinLive(它不接受内部雪花 id_str)。
+      get_unique_id 走用户主页→抖音号(未开播也可换算, 缓存跨场复用);
+      直播分享短链(重定向带 reflow)由 get_sec_user_id 的 room_id 分支承接。
+    未开播时主页下不存在直播间, 无从连接(此时也无录制在跑)。"""
     m = re.search(r"live\.douyin\.com/(\d+)", record_url)
     if m:
         return m.group(1)
@@ -98,13 +101,15 @@ def room_id_from_url(record_url: str) -> str | None:
         return _room_id_cache[key]
     try:
         import asyncio
-        from src import spider
+        from src.room import get_unique_id, get_sec_user_id, UnsupportedUrlError
 
-        data = asyncio.run(spider.get_douyin_app_stream_data(url=record_url))
-        rid = str(data.get("id_str") or data.get("id") or "")
-        if rid and rid != "None":
-            _room_id_cache[key] = rid
-            return rid
+        try:
+            rid = asyncio.run(get_unique_id(record_url))
+        except UnsupportedUrlError:
+            rid, _sec = asyncio.run(get_sec_user_id(record_url))
+        if rid:
+            _room_id_cache[key] = str(rid)
+            return str(rid)
     except Exception as e:
         print(f"[danmaku] 房间号换算失败({record_url}): {e}")
     return None
