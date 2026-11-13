@@ -31,6 +31,8 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse
+from src.danmaku import collector as _danmu_collector
 
 # ---- .env 支持: 项目根目录的 .env 文件提供默认配置(注意: 不入库!) ----
 # 优先级: 已存在的环境变量 > .env 文件(setdefault 语义)
@@ -366,7 +368,13 @@ def get_anchors():
                 or names.get(lu, "")
                 or _name_cache.get(key, "")
             )
-            item = {"url": lu, "name": name}
+            _dm_global = bool(getattr(recorder, "danmaku_enable", True))
+            _dm_p = _danmu_collector.pref_for_url(lu)
+            item = {
+                "url": lu,
+                "name": name,
+                "danmaku": _dm_global and (True if _dm_p is None else _dm_p),
+            }
             (paused if line.lstrip().startswith("#") else active).append(item)
 
     for item in active + paused:
@@ -1007,7 +1015,20 @@ def _merge_worker(job: str, sources: list, out_path: Path) -> None:
             raise RuntimeError(
                 f"ffmpeg 退出码 {proc.returncode}: {tail.strip() or '无日志'}"
             )
-        _set(status="done", pct=100, path=str(out_path.relative_to(_record_root())))
+        # 弹幕重映射: 正常自分段直接前缀累加; 断连缺口检测+缺口弹幕丢弃+衔接段2
+        _dm: dict | None = None
+        try:
+            from src.danmaku import collector as _danmu_collector
+
+            _dm = _danmu_collector.build_merged_danmaku(sources, out_path)
+        except Exception as _e:
+            _dm = {"error": str(_e)}
+        _set(
+            status="done",
+            pct=100,
+            path=str(out_path.relative_to(_record_root())),
+            danmaku=_dm,
+        )
     except Exception as e:
         _set(status="failed", msg=str(e))
     finally:
@@ -1087,6 +1108,64 @@ def bili_upload_stub():
             "error": "B站上传接口未部署：服务器IP正被B站风控，解封后建议接入 biliup-rs（见 PLAN.md）"
         },
         status=503,
+    )
+
+
+# ---------------- 弹幕: 开关 / 回放 / 直播 SSE ----------------
+
+
+@app.get("/api/danmaku/config")
+def danmaku_config(url: str):
+    p = _danmu_collector.pref_for_url(url)
+    g = bool(getattr(recorder, "danmaku_enable", True))
+    return {"global": g, "overridden": p is not None, "enabled": g if p is None else p}
+
+
+class DanmakuToggleIn(BaseModel):
+    url: str
+    enabled: bool
+
+
+@app.post("/api/danmaku/toggle")
+def danmaku_toggle(item: DanmakuToggleIn):
+    """按主播开关弹幕转存(config/danmaku_config.ini, 全局开关为默认)"""
+    _danmu_collector.set_pref(item.url, item.enabled)
+    return {"ok": True, "url": item.url, "enabled": item.enabled}
+
+
+@app.get("/api/danmaku")
+def danmaku_playback(path: str):
+    """回放: 返回文件本地时间轴的弹幕事件(分片偏移由服务端计算)"""
+    target = _safe_resolve(path)
+    if target is None:
+        return JSONResponse({"error": "文件不存在"}, status_code=404)
+    info = _danmu_collector.playback_events_for(target)
+    if info is None:
+        return {"count": 0, "events": [], "gaps": [], "merged": False}
+    return info
+
+
+@app.get("/api/danmaku/live")
+def danmaku_live(record_name: str):
+    """边录边播: SSE 实时推当前录制会话的弹幕(约1s延迟, 比 HLS 画面快, 观感可接受)"""
+
+    def _gen():
+        last = 0
+        while True:
+            sess = _danmu_collector.get_session(record_name)
+            if sess is None:
+                yield "event: end\ndata: {}\n\n"
+                return
+            seq, events = sess.live_events_since(last)
+            last = seq
+            for ev in events:
+                yield f"event: danmaku\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            time.sleep(1)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
 
 

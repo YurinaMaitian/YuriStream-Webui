@@ -44,6 +44,7 @@ from src import spider, stream
 from src.proxy import ProxyDetector
 from src.utils import logger
 from src import utils
+from src.danmaku import collector as danmaku_collector
 from msg_push import dingtalk, xizhi, tg_bot, send_email, bark, ntfy, pushplus
 from ffmpeg_install import check_ffmpeg, ffmpeg_path, current_env_path
 
@@ -491,6 +492,7 @@ def run_script(command: str) -> None:
 
 def clear_record_info(record_name: str, record_url: str) -> None:
     global monitoring
+    danmaku_collector.stop(record_name)
     recording.discard(record_name)
     recording_names.pop(record_url, None)
     if record_url in url_comments and record_url in running_list:
@@ -558,6 +560,8 @@ def check_subprocess(
         startupinfo=get_startup_info(os_type),
     )
 
+    _on_record_ffmpeg_start(record_name, record_url, save_file_path)
+
     subs_file_path = save_file_path.rsplit(".", maxsplit=1)[0]
     subs_thread_name = f"subs_{Path(subs_file_path).name}"
     if create_time_file and not split_video_by_time and "音频" not in save_type:
@@ -588,9 +592,12 @@ def check_subprocess(
             else:
                 process.send_signal(signal.SIGINT)
             process.wait()
+            _on_record_ffmpeg_end(record_name)
             live_stream_urls.pop(record_name, None)
             return True
         time.sleep(1)
+
+    _on_record_ffmpeg_end(record_name)
 
     return_code = process.returncode
     stop_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -677,6 +684,32 @@ def get_record_headers(platform, live_url):
         "Blued直播": "referer:https://app.blued.cn",
     }
     return record_headers.get(platform)
+
+
+def _danmaku_pref(record_url: str) -> bool:
+    """是否采集弹幕: 全局开关 + config/danmaku_config.ini 按主播覆盖(None=跟随全局)"""
+    if not globals().get("danmaku_enable", False):
+        return False
+    p = danmaku_collector.pref_for_url(record_url)
+    return True if p is None else p
+
+
+def _on_record_ffmpeg_start(
+    record_name: str, record_url: str, save_file_path: str
+) -> None:
+    try:
+        danmaku_collector.on_ffmpeg_start(
+            record_name, record_url, save_file_path, _danmaku_pref(record_url)
+        )
+    except Exception as e:
+        logger.error(f"弹幕采集启动失败: {e}")
+
+
+def _on_record_ffmpeg_end(record_name: str) -> None:
+    try:
+        danmaku_collector.on_ffmpeg_end(record_name)
+    except Exception as e:
+        logger.error(f"弹幕采集分段结束失败: {e}")
 
 
 def is_flv_preferred_platform(link):
@@ -2479,6 +2512,7 @@ def check_ffmpeg_existence() -> bool:
 
 def main() -> None:
     global \
+        danmaku_enable, \
         _, \
         a, \
         acfun_cookie, \
@@ -2806,6 +2840,9 @@ def main() -> None:
             read_config_value(config, "录制设置", "同一时间访问网络的线程数", 3)
         )
         semaphore = threading.Semaphore(max_request)
+        danmaku_enable = options.get(
+            read_config_value(config, "录制设置", "是否采集弹幕(是/否)", "是"), True
+        )
         delay_default = int(read_config_value(config, "录制设置", "循环时间(秒)", 120))
         local_delay_default = int(
             read_config_value(config, "录制设置", "排队读取网址时间(秒)", 0)
